@@ -2,3 +2,38 @@
 __pycache__/
 *.py[cod]
 *$py.class
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env
+
+# Application logs and user data
+badwords_debug.log
+pref.json
+user.json
+settings.json
+dev.json
+.python_auto_installed
+
+# Downloaded binaries and libs
+libs/
+models/
+saves/
+ffmpeg_win.zip
+ffmpeg_static.tar.xz
+
+# IDEs
+.idea/
+.vscode/
+*.swp

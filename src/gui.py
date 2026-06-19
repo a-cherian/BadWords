@@ -1538,6 +1538,9 @@ class TranscriptionCanvas(QWidget):
         self._cached_visible_words = []
 
     def load_data(self, words_data):
+        import algorithms
+        if hasattr(algorithms, 'segment_and_merge_cjk'):
+            words_data = algorithms.segment_and_merge_cjk(words_data)
         self.words_data = words_data
         self._calculate_layout()
         self.update()
@@ -8273,7 +8276,15 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
         l_fillers.setSpacing(10)
         # Inline Filler Words Editor
         prefs = self.engine.load_preferences() or {}
-        fillers = prefs.get('filler_words', config.DEFAULT_BAD_WORDS)
+        lang_code = prefs.get('lang', 'Auto')
+        mapped_code = "auto"
+        if lang_code != "Auto":
+            for code, name in config.SUPPORTED_LANGUAGES.items():
+                if name.lower() == lang_code.lower():
+                    mapped_code = code
+                    break
+        default_fillers = config.DEFAULT_BAD_WORDS_BY_LANG.get(mapped_code, config.DEFAULT_BAD_WORDS)
+        fillers = prefs.get('filler_words', default_fillers)
         
         self.txt_fillers = QTextEdit()
         self.txt_fillers.setAcceptRichText(False)
@@ -8676,7 +8687,9 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
         if not hasattr(self, 'text_canvas') or not self.text_canvas.words_data: return
         import algorithms
         prefs = self.engine.load_preferences() or {}
-        fillers = prefs.get('filler_words', config.DEFAULT_BAD_WORDS)
+        lang_code = self._get_current_lang_code()
+        default_fillers = config.DEFAULT_BAD_WORDS_BY_LANG.get(lang_code, config.DEFAULT_BAD_WORDS)
+        fillers = prefs.get('filler_words', default_fillers)
         
         # Apply filler logic directly to the current state
         if hasattr(algorithms, 'apply_auto_filler_logic'):
@@ -8705,8 +8718,23 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
                 self.text_canvas.words_data = updated_words
                 self.text_canvas.update()
 
+    def _get_current_lang_code(self):
+        raw_lang = self._combo_lang.text() if hasattr(self, '_combo_lang') else 'Auto'
+        if raw_lang == 'Auto':
+            prefs = self.engine.load_preferences() or {}
+            raw_lang = prefs.get('lang', 'Auto')
+        lang_code = "auto"
+        if raw_lang != "Auto":
+            for code, name in config.SUPPORTED_LANGUAGES.items():
+                if name.lower() == raw_lang.lower():
+                    lang_code = code
+                    break
+        return lang_code
+
     def _on_reset_inline_fillers(self):
-        self.txt_fillers.setText(", ".join(config.DEFAULT_BAD_WORDS))
+        lang_code = self._get_current_lang_code()
+        default_fillers = config.DEFAULT_BAD_WORDS_BY_LANG.get(lang_code, config.DEFAULT_BAD_WORDS)
+        self.txt_fillers.setText(", ".join(default_fillers))
         self._on_save_inline_fillers()
 
     def _on_fillers_text_changed(self):
@@ -8799,7 +8827,7 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
             "lang_code":      prefs.get('lang', 'Auto'),
             "settings":       prefs,
             "title_bar_text": getattr(self, '_title_bar', None)._lbl_title.text() if hasattr(self, '_title_bar') else "BadWords",
-            "filler_words":   prefs.get('filler_words', config.DEFAULT_BAD_WORDS),
+            "filler_words":   prefs.get('filler_words', config.DEFAULT_BAD_WORDS_BY_LANG.get(self._get_current_lang_code(), config.DEFAULT_BAD_WORDS)),
             "words_data":     clean_words,
             "chapters":       getattr(self, '_chapters', []),
             "current_chapter_idx": getattr(self, '_current_chapter_idx', -1),
@@ -9667,7 +9695,28 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
         display_name = config.SUPPORTED_LANGUAGES.get(saved_lang, saved_lang)
         placeholder = self.txt("lbl_choose_recording_language") if hasattr(self, 'txt') else "Choose recording language"
         self._combo_lang.setText(display_name if display_name in lang_items else placeholder)
-        self._combo_lang.valueChanged.connect(lambda v: self.engine.save_preferences({"lang": v}))
+        
+        def _on_lang_changed(v):
+            self.engine.save_preferences({"lang": v})
+            mapped_code = "auto"
+            if v != "Auto":
+                for code, name in config.SUPPORTED_LANGUAGES.items():
+                    if name.lower() == v.lower():
+                        mapped_code = code
+                        break
+            curr_text = self.txt_fillers.toPlainText().strip()
+            all_defaults = [config.DEFAULT_BAD_WORDS] + list(config.DEFAULT_BAD_WORDS_BY_LANG.values())
+            is_default = False
+            for d in all_defaults:
+                if curr_text == ", ".join(d):
+                    is_default = True
+                    break
+            if is_default or not curr_text:
+                new_defaults = config.DEFAULT_BAD_WORDS_BY_LANG.get(mapped_code, config.DEFAULT_BAD_WORDS)
+                self.txt_fillers.setText(", ".join(new_defaults))
+                self._on_save_inline_fillers()
+
+        self._combo_lang.valueChanged.connect(_on_lang_changed)
         l_trans.addLayout(_row(self.txt("lbl_lang"), self._combo_lang))
         l_trans.addSpacing(10)
 
@@ -10304,7 +10353,7 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
             "lang": lang_code,
             "model": model,
             "device": "Auto",
-            "filler_words": config.DEFAULT_BAD_WORDS,
+            "filler_words": [w.strip() for w in self.txt_fillers.toPlainText().split(',') if w.strip()],
             "timeline_name": selected_tl_name or None,
             "track_indices": track_indices or None,
         }

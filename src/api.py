@@ -1159,11 +1159,11 @@ class ResolveHandler:
                         # ONLY remove <trackindex> from <sourcetrack> if the clip points to a strictly audio file (.wav/.mp3).
                         # Removing the whole <sourcetrack> causes Resolve to fail the XML import!
                         # By removing just <trackindex>, we keep XML valid but prevent Resolve from forcing Mono Channel 1.
-                        if is_audio_file:
-                            for st_el in new_ci.findall('sourcetrack'):
-                                idx_el = st_el.find('trackindex')
-                                if idx_el is not None:
-                                    st_el.remove(idx_el)
+                        # if is_audio_file:
+                        #     for st_el in new_ci.findall('sourcetrack'):
+                        #         idx_el = st_el.find('trackindex')
+                        #         if idx_el is not None:
+                        #             st_el.remove(idx_el)
 
                         track.append(new_ci)
 

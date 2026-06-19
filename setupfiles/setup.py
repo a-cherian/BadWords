@@ -33,7 +33,7 @@ PLAT = ARGS.platform.lower()
 _IS_WINDOWS_TERMINAL = bool(os.environ.get("WT_SESSION", ""))
 
 # ── Platform helpers ─────────────────────────────────────────
-APP_NAME = "BadWords"
+APP_NAME = "BadWordsZH"
 
 def _default_install_dir():
     if PLAT.startswith("win"):
@@ -774,8 +774,8 @@ def get_latest_tag(force_main=False):
 def detect_existing_install(default_dir, resolve_script_dirs):
     """Search all known Resolve script dirs for a BadWords wrapper with a valid INSTALL_DIR."""
     for resolve_dir in resolve_script_dirs:
-        for wf in [os.path.join(resolve_dir, "BadWords.py"),
-                   os.path.join(resolve_dir, "BadWords (Linux).py")]:
+        for wf in [os.path.join(resolve_dir, "BadWordsZH.py"),
+                   os.path.join(resolve_dir, "BadWordsZH (Linux).py")]:
             if not os.path.isfile(wf):
                 continue
             try:
@@ -932,7 +932,7 @@ else:
     for rd in targets:
         try:
             os.makedirs(rd, exist_ok=True)
-            wp = os.path.join(rd, "BadWords.py")
+            wp = os.path.join(rd, "BadWordsZH.py")
             with open(wp, "w", encoding="utf-8") as f:
                 f.write(wrapper_content)
             os.chmod(wp, 0o755)
@@ -1514,14 +1514,14 @@ def option_install_update(force_main=False, preset_path=None, title="── Stan
         torch_ok = subprocess.run([venv_pip, "show", "torch"], capture_output=True).returncode == 0
         if is_update and torch_ok:
             log_info("PyTorch already present. Upgrading Whisper only...")
-            _pip_run("install", "--upgrade", "faster-whisper", "stable-ts", "pypdf", "-q",
-                     label="Upgrading Whisper / Stable-TS / PyPDF")
+            _pip_run("install", "--upgrade", "faster-whisper", "stable-ts", "pypdf", "zhconv", "-q",
+                     label="Upgrading Whisper / Stable-TS / PyPDF / zhconv")
         elif not has_nvidia:
             _pip_run("install", "torch", "torchaudio",
                      "--index-url", "https://download.pytorch.org/whl/cpu", "-q",
                      label="Installing PyTorch (CPU build)")
-            _pip_run("install", "faster-whisper", "stable-ts", "pypdf", "-q",
-                     label="Installing Faster-Whisper + Stable-TS")
+            _pip_run("install", "faster-whisper", "stable-ts", "pypdf", "zhconv", "-q",
+                     label="Installing Faster-Whisper + Stable-TS + zhconv")
         else:
             # Try CUDA indexes newest → oldest, CPU as final fallback
             cuda_ok = False
@@ -1544,9 +1544,9 @@ def option_install_update(force_main=False, preset_path=None, title="── Stan
                 _pip_run("install", "torch", "torchaudio",
                          "--index-url", "https://download.pytorch.org/whl/cpu", "-q",
                          label="Installing PyTorch (CPU fallback)")
-            _pip_run("install", "faster-whisper", "stable-ts", "pypdf",
+            _pip_run("install", "faster-whisper", "stable-ts", "pypdf", "zhconv",
                      *nvidia_pkgs.split(), "-q",
-                     label="Installing Faster-Whisper + Stable-TS + CUDA libs")
+                     label="Installing Faster-Whisper + Stable-TS + CUDA libs + zhconv")
 
         pyside_ok = subprocess.run([venv_py, "-c", "import PySide6"], capture_output=True).returncode == 0
         if not pyside_ok:
@@ -1614,7 +1614,7 @@ def option_install_update(force_main=False, preset_path=None, title="── Stan
             log_ok("DaVinci Resolve wrapper installed.")
             # Show where wrappers were placed
             for rd in resolve_dirs:
-                wp = os.path.join(rd, "BadWords.py")
+                wp = os.path.join(rd, "BadWordsZH.py")
                 if os.path.isfile(wp):
                     log_info(f"  → {wp}")
         else:
@@ -1651,10 +1651,10 @@ def option_install_update(force_main=False, preset_path=None, title="── Stan
             console.print(Text(f"{PAD}   1. Python was installed in the background.", style="yellow"), no_wrap=True)
             console.print(Text(f"{PAD}   2. You MUST restart DaVinci Resolve to detect it", style="bold yellow"), no_wrap=True)
             console.print(Text(f"{PAD}      If that fails, a reboot might be required", style="bold yellow"), no_wrap=True)
-            console.print(Text(f"{PAD}   3. Find the script in: Workspace -> Scripts -> BadWords", style="yellow"), no_wrap=True)
+            console.print(Text(f"{PAD}   3. Find the script in: Workspace -> Scripts -> BadWordsZH", style="yellow"), no_wrap=True)
         else:
             console.print(Text(f"{PAD}   1. A restart of DaVinci Resolve might be required.", style="yellow"), no_wrap=True)
-            console.print(Text(f"{PAD}   2. Find the script in: Workspace -> Scripts -> BadWords", style="yellow"), no_wrap=True)
+            console.print(Text(f"{PAD}   2. Find the script in: Workspace -> Scripts -> BadWordsZH", style="yellow"), no_wrap=True)
         console.print()
 
     finally:
@@ -2024,7 +2024,7 @@ def option_move():
                 _pip("Installing PyTorch (CPU fallback)", "install", "torch", "torchaudio",
                      "--index-url", "https://download.pytorch.org/whl/cpu", "-q")
         _pip("Installing Faster-Whisper + Stable-TS + PyPDF",
-             "install", "faster-whisper", "stable-ts", "pypdf", "-q")
+             "install", "faster-whisper", "stable-ts", "pypdf", "zhconv", "-q")
         if subprocess.run([venv_py, "-c", "import PySide6"], capture_output=True).returncode != 0:
             _pip("Installing PySide6", "install", "PySide6", "-q")
 

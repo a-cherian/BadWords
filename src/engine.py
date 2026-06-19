@@ -407,6 +407,12 @@ except Exception as e:
         
         prefs = self.os_doc.get_all_prefs()
 
+        # Boost beam size for CJK languages if it is at the default of 1
+        resolved_beam_size = prefs.get('ai_beam_size', 1)
+        if resolved_beam_size == 1 and lang and str(lang).lower().strip() in ("zh", "yue", "ja", "ko"):
+            resolved_beam_size = 5
+            log_info(f"[BeamSizeBoost] Boosting beam size to 5 for CJK language: {lang}")
+
         initial_prompt_str = ""
         if verbatim:
             # Stage 6A: Use user's custom initial prompt if set, else fall back to DEFAULT_WHISPER_PROMPT
@@ -523,7 +529,7 @@ try:
         
         chunk_result = model.transcribe(
             chunk,
-            beam_size={repr(prefs.get('ai_beam_size', 1))},
+            beam_size={repr(resolved_beam_size)},
             patience={repr(prefs.get('ai_patience', 1.0))},
             language={repr(lang) if lang != 'Auto' else 'None'},
             initial_prompt={repr(initial_prompt_str)},
@@ -611,7 +617,7 @@ try:
     # Parameters for strict VERBATIM output (STAGE 9: Unchain for phrasal retakes)
     result = model.transcribe(
         {repr(audio_path)}, 
-        beam_size={repr(prefs.get('ai_beam_size', 1))},
+        beam_size={repr(resolved_beam_size)},
         patience={repr(prefs.get('ai_patience', 1.0))},
         language={repr(lang) if lang != "Auto" else "None"},
         initial_prompt={repr(initial_prompt_str)},

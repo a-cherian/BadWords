@@ -38,6 +38,27 @@ import zipfile
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from osdoc import log_info
+from zh_mapping import to_simplified
+
+try:
+    import jieba
+    HAS_JIEBA = True
+except ImportError:
+    HAS_JIEBA = False
+
+try:
+    import pypdf
+    HAS_PYPDF = True
+except ImportError:
+    HAS_PYPDF = False
+
+try:
+    from pypinyin import lazy_pinyin
+    HAS_PYPINYIN = True
+except ImportError:
+    HAS_PYPINYIN = False
+
+
 
 # ==========================================
 # CONSTANTS & CONFIG
@@ -128,8 +149,9 @@ def read_docx_text(path):
         return f"[Error reading .docx] {e}"
 
 def read_pdf_text(path):
+    if not HAS_PYPDF:
+        return "[Error] pypdf library missing."
     try:
-        import pypdf # type: ignore
         reader = pypdf.PdfReader(path)
         text = ""
         for page in reader.pages:
@@ -140,8 +162,6 @@ def read_pdf_text(path):
         # PATCH v6.6: Aggressive whitespace normalization for PDFs
         # PDFs often have weird line breaks that break tokenization.
         return re.sub(r'\s+', ' ', text).strip()
-    except ImportError:
-        return "[Error] pypdf library missing."
     except Exception as e:
         return f"[Error reading PDF] {e}"
 
@@ -149,13 +169,32 @@ def read_pdf_text(path):
 # 2. PREPROCESSING & TOKENIZATION v5.0
 # ==========================================
 
+def has_cjk(text):
+    """Checks if text contains CJK characters (Chinese, Japanese, Korean)."""
+    if not text:
+        return False
+    return any(
+        '\u4e00' <= char <= '\u9fff' or
+        '\u3400' <= char <= '\u4dbf' or
+        '\uf900' <= char <= '\ufaff' or
+        '\u3040' <= char <= '\u309f' or
+        '\u30a0' <= char <= '\u30ff' or
+        '\uac00' <= char <= '\ud7a3'
+        for char in text
+    )
+
 def super_clean(text):
     """
     Funkcja pomocnicza 'SuperCompare' (część A).
-    Usuwa WSZYSTKO co nie jest cyfrą lub literą (a-z, 0-9).
+    Usuwa WSZYSTKO co nie jest cyfrą, literą lub znakiem CJK/Japonia/Korea.
     """
     if not text: return ""
-    return re.sub(r'[^a-z0-9]', '', text.lower())
+    cleaned = re.sub(
+        r'[^a-z0-9\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7a3]',
+        '',
+        text.lower()
+    )
+    return to_simplified(cleaned)
 
 def tokenize_v5(text):
     """
@@ -166,19 +205,128 @@ def tokenize_v5(text):
     """
     if not text: return []
     
-    # Pre-clean excessive whitespace to be safe
-    text = re.sub(r'\s+', ' ', text)
+    # Normalize traditional to simplified Chinese
+    text = to_simplified(text)
     
-    raw_tokens = text.lower().split()
-    clean_tokens = []
-    
-    for t in raw_tokens:
-        # Usuń interpunkcję z krawędzi słowa
-        stripped = t.strip(".,?!:;\"'()[]{}")
-        if stripped:
-            clean_tokens.append(stripped)
+    if HAS_JIEBA:
+        words = jieba.cut(text)
+        clean_tokens = []
+        cjk_and_ascii_punct = ".,?!:;\"'()[]{}<>，。！？：；“”‘’（）【】《》、…—"
+        for w in words:
+            stripped = w.strip(cjk_and_ascii_punct)
+            if stripped and stripped.strip():
+                clean_tokens.append(stripped.lower())
+        return clean_tokens
+    else:
+        # Fallback to character-by-character regex split
+        text = re.sub(r'([\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7a3])', r' \1 ', text)
+        
+        # Pre-clean excessive whitespace to be safe
+        text = re.sub(r'\s+', ' ', text)
+        
+        raw_tokens = text.lower().split()
+        clean_tokens = []
+        
+        # CJK and ASCII punctuation characters
+        cjk_and_ascii_punct = ".,?!:;\"'()[]{}<>，。！？：；“”‘’（）【】《》、…—"
+        
+        for t in raw_tokens:
+            # Usuń interpunkcję z krawędzi słowa
+            stripped = t.strip(cjk_and_ascii_punct)
+            if stripped:
+                clean_tokens.append(stripped)
+                
+        return clean_tokens
+
+def segment_and_merge_cjk(words_data):
+    if not words_data:
+        return words_data
+    if not HAS_JIEBA:
+        return words_data
+        
+    # Group consecutive active words
+    groups = []
+    current_group = []
+    for idx, w in enumerate(words_data):
+        is_sil = w.get('type') in ('silence', 'inaudible') or w.get('is_inaudible') or w.get('_is_hallucination')
+        if is_sil:
+            if current_group:
+                groups.append(current_group)
+                current_group = []
+            groups.append(idx)
+        else:
+            current_group.append(idx)
+    if current_group:
+        groups.append(current_group)
+        
+    new_words_data = []
+    for item in groups:
+        if isinstance(item, int):
+            new_words_data.append(words_data[item])
+        else:
+            # Check if this group has any CJK characters
+            has_any_cjk = False
+            full_text = ""
+            char_to_word_idx = []
             
-    return clean_tokens
+            for idx in item:
+                w_text = words_data[idx].get('text', '')
+                if has_cjk(w_text):
+                    has_any_cjk = True
+                for char in w_text:
+                    full_text += char
+                    char_to_word_idx.append(idx)
+            
+            if not has_any_cjk:
+                # English or other non-CJK group: keep original items exactly as they are
+                for idx in item:
+                    new_words_data.append(words_data[idx])
+                continue
+                
+            # CJK-active group: segment and merge using jieba
+            if not full_text:
+                continue
+                
+            simp_text = to_simplified(full_text)
+            segmented_simp = list(jieba.cut(simp_text))
+            
+            char_ptr = 0
+            for word_simp in segmented_simp:
+                word_len = len(word_simp)
+                if word_len == 0:
+                    continue
+                
+                word_orig = full_text[char_ptr : char_ptr + word_len]
+                word_indices = char_to_word_idx[char_ptr : char_ptr + word_len]
+                char_ptr += word_len
+                
+                if not word_indices:
+                    continue
+                    
+                first_w = words_data[word_indices[0]]
+                last_w = words_data[word_indices[-1]]
+                
+                merged_word = {
+                    "text": word_orig,
+                    "start": first_w.get("start", 0.0),
+                    "end": last_w.get("end", 0.0),
+                    "type": first_w.get("type", "word"),
+                    "id": first_w.get("id", 0),
+                    "seg_start": first_w.get("seg_start", 0.0),
+                    "seg_end": last_w.get("seg_end", 0.0),
+                    "is_segment_start": first_w.get("is_segment_start", False),
+                }
+                for k, v in first_w.items():
+                    if k not in merged_word:
+                        merged_word[k] = v
+                        
+                new_words_data.append(merged_word)
+                
+    for i, w in enumerate(new_words_data):
+        w['id'] = i
+        
+    return new_words_data
+
 
 # ==========================================
 # 3. FUZZY LOGIC & PHONETICS
@@ -212,6 +360,9 @@ def check_fuzzy_match(s1, s2):
     
     if not c1 or not c2: return False
     
+    if has_cjk(c1) or has_cjk(c2):
+        return c1 == c2
+        
     sim = calculate_similarity(c1, c2)
     length = max(len(c1), len(c2))
     min_length = min(len(c1), len(c2))
@@ -251,512 +402,6 @@ class AnalysisResult(list):
         super().__init__(iterable if iterable else [])
         self.missing_indices = []
 
-class CompareEngineV5:
-    def __init__(self, script_text, words_data, algo_settings=None):
-        # --- Stage 6A: Unpack algorithm tuning parameters with safe defaults ---
-        _s = algo_settings or {}
-        # fuzzy_threshold is stored as 0-100 in settings; normalize to 0.0-1.0
-        self.fuzzy_thresh     = _s.get('algo_fuzzy_threshold', 80) / 100.0
-        self.retake_lookahead = int(_s.get('algo_retake_lookahead', 80))
-        self.distance_penalty = float(_s.get('algo_distance_penalty', 2.0))  # reserved for future use
-        self.anchor_depth     = int(_s.get('algo_anchor_depth', 3))           # reserved for future use
-
-        # A. Przygotowanie danych
-        self.script_tokens = tokenize_v5(script_text)
-        
-        # Mapa Skryptu (Global Indexing)
-        self.script_map = defaultdict(list)
-        for idx, word in enumerate(self.script_tokens):
-            self.script_map[word].append(idx)
-        
-        # Filtrowanie transkryptu (Z OMIJANIEM HALUCYNACJI)
-        self.trans_tokens = []
-        self.trans_indices = [] 
-        
-        for idx, w in enumerate(words_data):
-            if w.get('type') == 'silence' or w.get('is_inaudible') or w.get('_is_hallucination'):
-                # v7.6 Clean up skipped words so they don't retain colors from previous runs
-                w['status'] = w.get('manual_status')
-                w['selected'] = bool(w['status'])
-                w['is_auto'] = False
-                continue
-            
-            # W transkrypcie Whisper daje czyste słowa, ale upewnijmy się
-            clean = w['text'].strip(".,?!:;\"'()[]{}").lower()
-            if clean:
-                self.trans_tokens.append(clean)
-                self.trans_indices.append(idx)
-        
-        self.words_data = words_data
-        self.s_len = len(self.script_tokens)
-        self.t_len = len(self.trans_tokens)
-        
-        # Mapa Historii (Gdzie skrypt[k] wystąpił w transkrypcie?)
-        # Klucz: Script Index (k), Wartość: Transcript Index (j)
-        self.history_map = {} 
-        
-        # PATCH v5.8: Strict Trace Map
-        # Rejestr wszystkich dopasowań: TraceMap[index_transkryptu] = index_skryptu
-        self.trace_map = {}
-        
-        # PATCH v6.3: List to track missing script parts for Yellow highlighting
-        self.missing_script_indices = []
-
-    def mark_range(self, t_start_idx, t_end_idx, status, is_auto=False):
-        """Oznacza zakres w words_data (indeksy wirtualne -> rzeczywiste)."""
-        for k in range(t_start_idx, t_end_idx + 1):
-            if k >= self.t_len: break
-            real_idx = self.trans_indices[k]
-            w = self.words_data[real_idx]
-            
-            # Reset
-            w['status'] = None
-            w['selected'] = False
-            w['is_auto'] = False
-            w['manual_status'] = None  # Reset manual override on fresh analysis
-            w['algo_status'] = None    # Reset algo memory
-            
-            if status != 'normal':
-                w['status'] = status
-                w['selected'] = True
-                w['is_auto'] = is_auto
-                
-                # NEW: Save algo origin for overlay reload logic
-                if is_auto:
-                    w['algo_status'] = status
-
-    def _add_trace(self, t_idx, s_idx):
-        """
-        PATCH v6.0: ANCHOR SECURITY.
-        Dodaje do mapy TYLKO jeśli dopasowanie jest częścią sekwencji.
-        Eliminuje 'Blue Ocean' spowodowany przypadkowymi pojedynczymi trafieniami.
-        """
-        # Sprawdzenie wsteczne (Continuity)
-        # Czy poprzednie słowo w transkrypcie (t-1) pasowało do poprzedniego słowa w skrypcie (s-1)?
-        prev_match = (self.trace_map.get(t_idx - 1) == s_idx - 1)
-        
-        # Sprawdzenie w przód (Lookahead)
-        # Czy następne słowo (t+1) pasuje do następnego słowa skryptu (s+1)?
-        next_match = False
-        if t_idx + 1 < self.t_len and s_idx + 1 < self.s_len:
-            if self.super_compare(self.script_tokens[s_idx+1], self.trans_tokens[t_idx+1]):
-                next_match = True
-        
-        # Dodajemy tylko, jeśli mamy kontekst (sąsiada)
-        if prev_match or next_match:
-            self.trace_map[t_idx] = s_idx
-
-    def super_compare(self, s1, s2):
-        """Funkcja pomocnicza B: SuperCompare."""
-        return super_clean(s1) == super_clean(s2)
-
-    def _fuzzy_match(self, s1, s2):
-        """
-        Stage 6A: Instance-level fuzzy match that uses self.fuzzy_thresh
-        (derived from algo_fuzzy_threshold setting, normalized 0-1).
-        Keeps phonetic fallback from module-level check_fuzzy_match.
-        """
-        c1 = super_clean(s1)
-        c2 = super_clean(s2)
-        if not c1 or not c2:
-            return False
-        sim = calculate_similarity(c1, c2)
-        length = max(len(c1), len(c2))
-        min_length = min(len(c1), len(c2))
-        
-        # v7.5 Anti-Cascade: Prevent absurd matches like "are" vs "a"
-        if length > 0 and (min_length / length) < 0.4:
-            return False
-        # Scale short/mid thresholds relative to the user's long threshold
-        thresh = self.fuzzy_thresh
-        if length < 4:   thresh = min(thresh, THRESH_SHORT)
-        elif length <= 7: thresh = min(thresh, THRESH_MID)
-        if sim >= thresh:
-            return True
-        # Phonetic fallback
-        if sim >= 0.50:
-            ph1 = simplified_metaphone(c1)
-            ph2 = simplified_metaphone(c2)
-            if ph1 and ph2 and ph1 == ph2:
-                return True
-        return False
-
-    def get_numeric_sequence_val(self, tokens, start_idx):
-        """
-        Pomocnik do Kroku 0. Zwraca ciąg samych cyfr oraz ile tokenów zużył.
-        """
-        buffer = ""
-        count = 0
-        limit = min(len(tokens), start_idx + 10) 
-        for k in range(start_idx, limit):
-            word = tokens[k]
-            has_digit = any(c.isdigit() for c in word)
-            if not has_digit: break
-            digits = "".join(filter(str.isdigit, word))
-            buffer += digits
-            count += 1
-        return buffer, count
-
-    def run(self):
-        i = 0 # Script index
-        j = 0 # Trans index
-        
-        log_info(f"--- STARTING COMPARE v6.7 (Script: {self.s_len}, Trans: {self.t_len}) ---")
-
-        # -------------------------------------------------
-        # PHASE -1: HEAD SYNC (PATCH v6.6)
-        # Fixes startup crash when script has a long title/intro not present in audio.
-        # Finds where the transcript actually begins in the script.
-        # -------------------------------------------------
-        head_search_limit = min(self.s_len, 300) # Check first 300 words of script
-        trans_sample_len = min(self.t_len, 5)   # Use first 5 words of transcript
-        
-        if head_search_limit > 0 and trans_sample_len >= 3:
-            best_k = -1
-            # Try to find the first 3 words of transcript in the beginning of script
-            for k in range(head_search_limit):
-                match_count = 0
-                for m in range(3): # Check tri-gram
-                    if k + m < self.s_len and m < self.t_len:
-                        if self.super_compare(self.script_tokens[k+m], self.trans_tokens[m]):
-                            match_count += 1
-                        else:
-                            break
-                
-                if match_count == 3: # Found a solid anchor of 3 words
-                    best_k = k
-                    break
-            
-            if best_k > 0:
-                log_info(f"[Head Sync] Detected offset. Skipping first {best_k} script words (Title/Intro).")
-                # Mark skipped words as missing
-                for skipped in range(best_k):
-                    self.missing_script_indices.append(skipped)
-                i = best_k # Move script pointer to the actual start
-
-        while i < self.s_len and j < self.t_len:
-            s_word = self.script_tokens[i]
-            t_word = self.trans_tokens[j]
-            
-            # -------------------------------------------------
-            # KROK 0: AGRESYWNE LICZBY (NUMERIC GREED)
-            # -------------------------------------------------
-            if any(c.isdigit() for c in s_word):
-                s_digits, s_count = self.get_numeric_sequence_val(self.script_tokens, i)
-                t_digits, t_count = self.get_numeric_sequence_val(self.trans_tokens, j)
-                
-                if s_digits and t_digits and s_digits == t_digits:
-                    # MATCH!
-                    self.mark_range(j, j + t_count - 1, 'normal')
-                    
-                    # TraceMap Update for Numerics
-                    # Liczby z natury są sekwencją cyfr, więc traktujemy je jako pewne
-                    for offset in range(t_count):
-                         self.trace_map[j + offset] = i 
-
-                    # Historia (Legacy)
-                    for offset in range(s_count):
-                         if j + offset < j + t_count:
-                             self.history_map[i + offset] = j + offset
-                         else:
-                             self.history_map[i + offset] = j + t_count - 1
-
-                    i += s_count
-                    j += t_count
-                    continue
-            
-            # -------------------------------------------------
-            # KROK 1: SUPER EXACT (SUPER NORMALIZATION)
-            # -------------------------------------------------
-            if self.super_compare(s_word, t_word):
-                self.mark_range(j, j, 'normal')
-                self.history_map[i] = j
-                self._add_trace(j, i) # v6.0 Secure Trace
-                i += 1
-                j += 1
-                continue
-            
-            # -------------------------------------------------
-            # KROK 2: TOLERANCJA (STOP WORDS)
-            # -------------------------------------------------
-            if s_word in STOP_WORDS and t_word in STOP_WORDS:
-                self.mark_range(j, j, 'normal')
-                self.history_map[i] = j
-                self._add_trace(j, i) # v6.0 Secure Trace
-                i += 1
-                j += 1
-                continue
-
-            # -------------------------------------------------
-            # KROK 3: INSERTION LOOKAHEAD (PATCH v5.9)
-            # -------------------------------------------------
-            if j + 1 < self.t_len and self.super_compare(s_word, self.trans_tokens[j+1]):
-                self.mark_range(j, j, 'bad')
-                j += 1
-                continue
-
-            # -------------------------------------------------
-            # KROK 4: FUZZY LOGIC (TYPO / MERGE / SPLIT)
-            # -------------------------------------------------
-            match_found = False
-            
-            # 1:1
-            if self._fuzzy_match(s_word, t_word):
-                self.mark_range(j, j, 'typo', is_auto=True)
-                self.history_map[i] = j
-                self._add_trace(j, i) # v6.0 Secure Trace
-                i += 1; j += 1
-                match_found = True
-            # Merge 1:2
-            elif j + 1 < self.t_len and self._fuzzy_match(s_word, t_word + self.trans_tokens[j+1]):
-                self.mark_range(j, j+1, 'typo', is_auto=True)
-                self.history_map[i] = j+1
-                self._add_trace(j, i)
-                self._add_trace(j+1, i)
-                i += 1; j += 2
-                match_found = True
-            # Split 2:1
-            elif i + 1 < self.s_len and self._fuzzy_match(s_word + self.script_tokens[i+1], t_word):
-                self.mark_range(j, j, 'typo', is_auto=True)
-                self.history_map[i] = j; self.history_map[i+1] = j
-                self._add_trace(j, i)
-                i += 2; j += 1
-                match_found = True
-                
-            if match_found:
-                continue
-
-            # -------------------------------------------------
-            # KROK 5: RESYNCHRONIZACJA (DELETION / RETAKE / BAD)
-            # -------------------------------------------------
-
-            # Krok 5a: DEEP YELLOW (Deletion Lookahead v6.2/6.3)
-            # Sprawdzamy do 4 słów w przód w skrypcie, czy coś pasuje do obecnego transkryptu
-            match_offset = -1
-            for offset in range(1, 5): # 1 to 4
-                if i + offset < self.s_len:
-                    s_cand = self.script_tokens[i+offset]
-                    # WARUNEK ROZSZERZONY: Exact LUB Fuzzy
-                    if self.super_compare(s_cand, t_word) or self._fuzzy_match(s_cand, t_word):
-                        match_offset = offset
-                        break
-            
-            if match_offset != -1:
-                # Znaleziono zgubę! Słowa od i do i+offset-1 są pominięte w audio (MISSING)
-                
-                # PATCH v6.3: Rejestracja brakujących indeksów ZANIM przesuniemy 'i'
-                for skipped in range(match_offset):
-                     self.missing_script_indices.append(i + skipped)
-
-                # Przesuwamy indeks skryptu 'i' do miejsca dopasowania.
-                i += match_offset
-                continue
-
-            # Krok 5b: Detekcja Retake (Fuzzy Anchor + Lookahead + Distance Penalty v6.5)
-            # Stage 6A: retake_lookahead from algo_settings controls the search window
-            found_retake = False
-            search_limit = max(0, i - self.retake_lookahead)
-            
-            for k in range(i - 1, search_limit - 1, -1):
-                s_candidate = self.script_tokens[k]
-                
-                # Weryfikacja kotwicy (Anchor Check)
-                is_anchor_candidate = self.super_compare(s_candidate, t_word)
-                if not is_anchor_candidate:
-                    # Always use standard _fuzzy_match for anchor candidates
-                    # v7.5: Removed the dangerous 0.40 threshold for < 4 chars that caused cascade failures
-                    is_anchor_candidate = self._fuzzy_match(s_candidate, t_word)
-                
-                if is_anchor_candidate:
-                    confirmed = False
-                    distance = i - k
-
-                    if distance <= 10:
-                        # BLISKO: Logika standardowa (Luźna)
-                        # 1. Długie, pewne słowo
-                        if len(super_clean(s_candidate)) > 6 and self.super_compare(s_candidate, t_word):
-                            confirmed = True
-                        # 2. Lookahead (Para słów)
-                        elif k + 1 < self.s_len and j + 1 < self.t_len:
-                            s_next = self.script_tokens[k+1]
-                            lookahead_j = j + 1
-                            # Check brief window for next match
-                            while lookahead_j < self.t_len and lookahead_j < j + 4:
-                                t_next = self.trans_tokens[lookahead_j]
-                                if self.super_compare(s_next, t_next) or self._fuzzy_match(s_next, t_next):
-                                    confirmed = True
-                                    break
-                                lookahead_j += 1
-                    else:
-                        # DALEKO (>10 słów): Logika ścisła (Trigram)
-                        # Wymagamy, aby pasowały 3 słowa z rzędu (k, k+1, k+2 -> j, j+1, j+2)
-                        # Minimalizuje ryzyko fałszywych dopasowań przy popularnych słowach
-                        if k + 2 < self.s_len and j + 2 < self.t_len:
-                            s_1 = self.script_tokens[k+1]
-                            s_2 = self.script_tokens[k+2]
-                            t_1 = self.trans_tokens[j+1]
-                            t_2 = self.trans_tokens[j+2]
-                            
-                            # Używamy super_compare (exact) dla pewności
-                            if self.super_compare(s_1, t_1) and self.super_compare(s_2, t_2):
-                                confirmed = True
-
-                    if confirmed:
-                        j_start = self.history_map.get(k)
-                        if j_start is not None and j_start < j:
-                            # v7.5 Anti Blue Ocean: Don't color massive gaps!
-                            if j - j_start > 40:
-                                continue
-                                
-                            self.mark_range(j_start, j, 'repeat')
-                            
-                            # --- v7.4 STRICT FIRST WORD RECOVERY ---
-                            # Only recover words safely, avoiding infinite fuzzy match loops.
-                            # We step backward strictly checking exact super_compare.
-                            walk_k = k - 1
-                            walk_j = j - 1
-                            walk_j_start = j_start - 1
-                            
-                            while walk_k >= 0 and walk_j >= 0 and walk_j_start >= 0:
-                                # Strict exact match only! No fuzzy match to prevent cascades.
-                                curr_match = self.super_compare(self.script_tokens[walk_k], self.trans_tokens[walk_j])
-                                prev_match = self.super_compare(self.script_tokens[walk_k], self.trans_tokens[walk_j_start])
-                                
-                                if curr_match and prev_match:
-                                    self._add_trace(walk_j, walk_k)
-                                    self._add_trace(walk_j_start, walk_k)
-                                    self.history_map[walk_k] = walk_j
-                                    
-                                    walk_k -= 1
-                                    walk_j -= 1
-                                    walk_j_start -= 1
-                                else:
-                                    break
-                            
-                            i = k + 1
-                            self.history_map[k] = j 
-                            self._add_trace(j, k)
-                            j += 1
-                            found_retake = True
-                            break
-            
-            if found_retake:
-                continue
-
-            # Krok 5c: Błąd (Insertion / Bad) - Fallback
-            self.mark_range(j, j, 'bad')
-            j += 1
-            # i bez zmian
-        
-        # Cleanup
-        if j < self.t_len:
-            self.mark_range(j, self.t_len - 1, 'bad')
-
-        # PATCH v6.3: TAIL CATCH
-        # Jeśli skończyło się audio, a został skrypt -> Wszystko do końca jest MISSING
-        while i < self.s_len:
-            self.missing_script_indices.append(i)
-            i += 1
-            
-        log_info("--- PHASE C FINISHED. STARTING PHASE D: SMART FRAGMENT FILL ---")
-        self._phase_d_smart_fragment_fill()
-        
-        # --- PHASE E: COVERAGE VALIDATION (PATCH v6.7) ---
-        # The ultimate filter: if a script index was EVER matched (even as a retake or typo),
-        # it is NOT missing. We check history_map which records all successful matches.
-        
-        real_missing = []
-        for s_idx in self.missing_script_indices:
-            if s_idx not in self.history_map:
-                real_missing.append(s_idx)
-        
-        self.missing_script_indices = real_missing
-        log_info(f"[Phase E] Coverage Validation complete. Final missing count: {len(self.missing_script_indices)}")
-
-        # --- PHASE F: STOP WORD FILTER (v7.6) ---
-        # User request: "If an inserted word is just 'the' or 'a', don't mark it red, just ignore it."
-        for w in self.words_data:
-            if w.get('status') == 'bad' and not w.get('manual_status'):
-                clean = w.get('text', '').strip(".,?!:;\"'()[]{}").lower()
-                if clean in STOP_WORDS:
-                    w['status'] = None
-                    w['selected'] = False
-                    w['is_auto'] = False
-
-        # PATCH v6.4: ANTI-FREEZE HYBRID RETURN
-        # Zamiast krotki, zwracamy listę (AnalysisResult), która ma atrybut .missing_indices.
-        result = AnalysisResult(self.words_data)
-        result.missing_indices = self.missing_script_indices
-        return result
-
-    # ==========================================
-    # PHASE D: SMART FRAGMENT FILL (PATCH v5.8)
-    # ==========================================
-    def _phase_d_smart_fragment_fill(self):
-        """
-        PATCH v5.8: Smart Fragment Fill.
-        Analizuje TraceMap, ale liczy GRUPY (Smart Occurrence Counting),
-        aby nie traktować pociętych liczb (IP, telefony) jako powtórzeń.
-        """
-        if not self.trace_map:
-            return
-
-        occurrences = defaultdict(list)
-        
-        for t_idx, s_idx in self.trace_map.items():
-            occurrences[s_idx].append(t_idx)
-
-        sorted_script_indices = sorted(occurrences.keys())
-
-        log_info(f"[Phase D] Analyzing {len(sorted_script_indices)} unique script words...")
-
-        count_retakes = 0
-        
-        for s_idx in sorted_script_indices:
-            times = occurrences[s_idx]
-            
-            # Musi być co najmniej 2 punkty, żeby w ogóle myśleć o powtórzeniu
-            if len(times) < 2:
-                continue
-
-            # Sortujemy indeksy transkryptu
-            times.sort()
-            
-            # --- SMART COUNTING LOGIC ---
-            # Liczymy ile jest ROZŁĄCZNYCH grup.
-            groups = 0
-            if times:
-                groups = 1 # Pierwsza liczba zawsze zaczyna grupę
-                for k in range(1, len(times)):
-                    # Jeśli obecny indeks NIE jest następnikiem poprzedniego, to nowa grupa
-                    if times[k] != times[k-1] + 1:
-                        groups += 1
-            
-            # Warunek RETAKE: Muszą być przynajmniej 2 grupy podejść
-            if groups < 2:
-                # To prawdopodobnie pocięta liczba/nazwa (np. IP address)
-                continue
-            
-            # --- LOCAL FLOOD FILL ---
-            # v7.4 Anti Blue-Ocean Shield: Do not flood-fill absurdly large gaps.
-            # If the span between the first take and the second take is huge,
-            # it's a mapping error or a false positive retake on a stop word.
-            local_start = times[0]
-            local_end = times[-1]
-            
-            if local_end - local_start > 50:
-                log_info(f"[Phase D] Skipping massive gap {local_end - local_start} words to prevent Blue Ocean.")
-                continue
-                
-            self.mark_range(local_start, local_end, 'repeat')
-            count_retakes += 1
-
-        log_info(f"--- PHASE D COMPLETED. Processed {count_retakes} genuine retake groups. ---")
-
-
-# ==========================================
-# 5. PUBLIC API (Adapter)
-# ==========================================
 
 def apply_debug_rgb_pattern(words_data):
     """
@@ -792,12 +437,156 @@ def apply_debug_rgb_pattern(words_data):
     result.missing_indices = [] # No missing script in debug mode
     return result
 
+
+class CompareEngine:
+    """
+    V7 Engine (Global Anchor + Gap Analysis)
+    Implements a strict binary trap for 94% accuracy.
+    """
+    def __init__(self, script_text, words_data, algo_settings=None):
+        self.script_text = script_text
+        self.words_data = words_data
+
+    def run(self):
+
+        def clean_text(text): 
+            return re.sub(r'[^\w\u4e00-\u9fff]', '', text)
+
+        def char_match(py1, py2, c1, c2):
+            if c1 == c2 and c1 != "": return 1.0
+            if py1 == py2 and py1 != "": return 0.8
+            if py1 and py2 and py1[0] == py2[0]: return 0.2
+            return 0.0
+
+        def global_alignment(T_pys, S_pys, T_chars, S_chars):
+            M = len(T_pys)
+            N = len(S_pys)
+            dp = [[0.0] * (N + 1) for _ in range(M + 1)]
+            ptr = [[0] * (N + 1) for _ in range(M + 1)]
+            
+            for i in range(1, M + 1):
+                dp[i][0] = i * -0.5
+                ptr[i][0] = 1
+            for j in range(1, N + 1):
+                dp[0][j] = j * -1.0
+                ptr[0][j] = 2
+                
+            for i in range(1, M + 1):
+                for j in range(1, N + 1):
+                    score = char_match(T_pys[i-1], S_pys[j-1], T_chars[i-1], S_chars[j-1])
+                    match = dp[i-1][j-1] + score
+                    delete = dp[i-1][j] - 0.5
+                    insert = dp[i][j-1] - 1.0
+                    
+                    best = max(match, delete, insert)
+                    dp[i][j] = best
+                    if best == match: ptr[i][j] = 0
+                    elif best == delete: ptr[i][j] = 1
+                    else: ptr[i][j] = 2
+                    
+            i, j = M, N
+            alignment = []
+            while i > 0 or j > 0:
+                if ptr[i][j] == 0:
+                    alignment.append(('match', i-1, j-1))
+                    i -= 1; j -= 1
+                elif ptr[i][j] == 1:
+                    alignment.append(('T_gap', i-1, None))
+                    i -= 1
+                else:
+                    alignment.append(('S_gap', None, j-1))
+                    j -= 1
+                    
+            alignment.reverse()
+            return alignment
+
+        def local_similarity(gap_T_pys, anchor_T_pys):
+            if len(gap_T_pys) == 0 or len(anchor_T_pys) == 0: return 0.0
+            M = len(gap_T_pys)
+            N = len(anchor_T_pys)
+            dp = [[0.0] * (N + 1) for _ in range(M + 1)]
+            max_score = 0
+            for i in range(1, M + 1):
+                for j in range(1, N + 1):
+                    sc = 1.0 if gap_T_pys[i-1] == anchor_T_pys[j-1] else 0.0
+                    match = dp[i-1][j-1] + sc
+                    delete = dp[i-1][j] - 0.5
+                    insert = dp[i][j-1] - 0.5
+                    best = max(0.0, match, delete, insert)
+                    dp[i][j] = best
+                    if best > max_score:
+                        max_score = best
+            return max_score / M if M > 0 else 0.0
+
+        S_chars = [c for c in clean_text(self.script_text)]
+        S_pys = [lazy_pinyin(c)[0] if lazy_pinyin(c) else "" for c in S_chars]
+
+        T_chars = []
+        T_pys = []
+        word_mapping = []
+        for w_idx, w in enumerate(self.words_data):
+            if w.get('type') in ['silence', 'inaudible'] or w.get('is_inaudible') or w.get('_is_hallucination'):
+                w['status'] = w.get('manual_status')
+                w['selected'] = bool(w.get('status'))
+                w['is_auto'] = False
+                continue
+                
+            clean = clean_text(w.get('text', ''))
+            for c in clean:
+                T_chars.append(c)
+                T_pys.append(lazy_pinyin(c)[0] if lazy_pinyin(c) else "")
+                word_mapping.append(w_idx)
+
+        alignment = global_alignment(T_pys, S_pys, T_chars, S_chars)
+        
+        blocks = []
+        current_type = None
+        curr_T = []
+        for t, i, j in alignment:
+            if t != current_type:
+                if current_type is not None:
+                    blocks.append({'type': current_type, 'T_indices': curr_T})
+                current_type = t
+                curr_T = []
+            if i is not None:
+                curr_T.append(i)
+        if current_type is not None:
+            blocks.append({'type': current_type, 'T_indices': curr_T})
+
+        for w in self.words_data:
+            if w.get('type') not in ['silence', 'inaudible'] and not w.get('is_inaudible') and not w.get('_is_hallucination'):
+                w['status'] = 'normal'
+                w['selected'] = False
+                w['is_auto'] = True
+
+        for idx, block in enumerate(blocks):
+            if block['type'] == 'T_gap':
+                next_match_T = []
+                for next_idx in range(idx + 1, len(blocks)):
+                    if blocks[next_idx]['type'] == 'match':
+                        next_match_T = blocks[next_idx]['T_indices']
+                        break
+                
+                if len(next_match_T) > 0 and len(block['T_indices']) > 0:
+                    gap_pys = [T_pys[i] for i in block['T_indices']]
+                    anchor_pys = [T_pys[i] for i in next_match_T][:30]
+                    similarity = local_similarity(gap_pys, anchor_pys)
+                    status = 'repeat' if similarity > 0.5 else 'bad'
+                else:
+                    status = 'bad'
+                    
+                for t_idx in block['T_indices']:
+                    w_idx = word_mapping[t_idx]
+                    self.words_data[w_idx]['status'] = status
+                    self.words_data[w_idx]['selected'] = True
+                    self.words_data[w_idx]['is_auto'] = True
+
+
 def compare_script_to_transcript(script_text, words_data, algo_settings=None):
     """
-    Wrapper dla silnika v5.0.
+    Wrapper dla silnika v7.0 DP.
     Includes Debug Interceptor for "$ R G B" code.
     STAGE 9: Applies sanitize_hallucinations() before alignment to strip model loops.
-    STAGE 6A: Accepts algo_settings dict and passes it to CompareEngineV5.
     """
     
     # --- DEBUG INTERCEPTOR ---
@@ -809,9 +598,8 @@ def compare_script_to_transcript(script_text, words_data, algo_settings=None):
     # STAGE 9: Strip hallucination loops from raw transcript before analysis
     words_data = sanitize_hallucinations(words_data)
 
-    engine = CompareEngineV5(script_text, words_data, algo_settings=algo_settings)
-    # PATCH v6.4: ANTI-FREEZE
-    # Return single object (AnalysisResult) instead of tuple to keep engine.py happy.
+    engine = CompareEngine(script_text, words_data, algo_settings=algo_settings)
+    return engine.run()
     return engine.run()
 
 def absorb_inaudible_into_repeats(words_data):
@@ -890,9 +678,22 @@ def analyze_repeats(words_data, show_inaudible=True, algo_settings=None):
         if w.get('is_inaudible'): continue
         if w.get('_is_hallucination'): continue # SKIPPING HALLUCINATIONS
         
-        txt = re.sub(r'[^\w]', '', w['text']).lower()
+        # Normalize to simplified
+        raw_text = to_simplified(w.get('text', ''))
+        txt = re.sub(r'[^\w\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7a3]', '', raw_text).lower()
         if not txt or txt in STOP_WORDS: continue
-        linear_flow.append({'text': txt, 'real_idx': idx})
+        
+        if HAS_JIEBA:
+            # Word-level CJK tokens
+            linear_flow.append({'text': txt, 'real_idx': idx})
+        else:
+            # Fallback to character-by-character CJK segments
+            if has_cjk(txt):
+                for char in txt:
+                    if char.strip():
+                        linear_flow.append({'text': char, 'real_idx': idx})
+            else:
+                linear_flow.append({'text': txt, 'real_idx': idx})
 
     n_flow = len(linear_flow)
     marked_indices = set()
@@ -903,7 +704,6 @@ def analyze_repeats(words_data, show_inaudible=True, algo_settings=None):
     MIN_LEN = 2
     
     # FIX OP-02: Mapowanie pozycji słów O(n) przed pętlą zamiast O(n²) nested loop
-    from collections import defaultdict
     word_positions = defaultdict(list)
     for idx_flow, entry in enumerate(linear_flow):
         word_positions[entry['text']].append(idx_flow)
@@ -946,9 +746,10 @@ def analyze_repeats(words_data, show_inaudible=True, algo_settings=None):
 # ==========================================
 
 def apply_auto_filler_logic(words_data, fillers, is_enabled):
-    fillers_lower = [f.lower() for f in fillers]
+    fillers_lower = [to_simplified(f.lower()) for f in fillers]
     for w in words_data:
-        clean_text = w.get('text', '').strip(".,?!:;\"'()[]{}").lower()
+        raw_text = to_simplified(w.get('text', ''))
+        clean_text = raw_text.strip(".,?!:;\"'()[]{}<>，。！？：；“”‘’„”（）【】《》、…—").lower()
         if is_enabled and clean_text in fillers_lower:
             if not w.get('manual_status'): # Do not overwrite manual markings
                 w['status'] = 'bad'
@@ -1036,7 +837,7 @@ def calculate_script_missing_ranges(text_content, missing_indices):
     for m in matches:
         raw = m.group()
         # Same cleaning logic as in engine/algo to ensure index alignment
-        clean = raw.strip(".,?!:;\"'()[]{}")
+        clean = raw.strip(".,?!:;\"'()[]{}<>，。！？：；“”‘’„”（）【】《》、…—")
         if clean:
             tokens_map.append(m)
 
@@ -1145,17 +946,55 @@ def _tokens_from_words_data(words_data):
     for w in words_data or []:
         if w.get("type") in ("silence", "inaudible") or w.get("is_inaudible"):
             continue
-        clean = super_clean(w.get("text", ""))
-        if clean:
+        raw_text = w.get("text", "").strip()
+        raw_text = to_simplified(raw_text)
+        
+        clean_full = super_clean(raw_text)
+        if not clean_full:
+            continue
+            
+        if HAS_JIEBA:
+            # Word-level CJK tokens using Jieba
             tokens.append({
                 "text": w.get("text", "").strip(),
-                "clean": clean,
+                "clean": clean_full,
                 "status": w.get("status"),
                 "word_id": w.get("id"),
                 "is_segment_start": w.get("is_segment_start", False),
                 "start": w.get("start", 0.0),
                 "original_word": w,
             })
+        else:
+            # Fallback to character-by-character CJK tokens
+            i_char = 0
+            while i_char < len(clean_full):
+                char = clean_full[i_char]
+                if has_cjk(char):
+                    tokens.append({
+                        "text": char,
+                        "clean": char,
+                        "status": w.get("status"),
+                        "word_id": w.get("id"),
+                        "is_segment_start": w.get("is_segment_start", False),
+                        "start": w.get("start", 0.0),
+                        "original_word": w,
+                    })
+                    i_char += 1
+                else:
+                    start_non_cjk = i_char
+                    while i_char < len(clean_full) and not has_cjk(clean_full[i_char]):
+                        i_char += 1
+                    non_cjk_part = clean_full[start_non_cjk:i_char]
+                    if non_cjk_part:
+                        tokens.append({
+                            "text": non_cjk_part,
+                            "clean": non_cjk_part,
+                            "status": w.get("status"),
+                            "word_id": w.get("id"),
+                            "is_segment_start": w.get("is_segment_start", False),
+                            "start": w.get("start", 0.0),
+                            "original_word": w,
+                        })
     return tokens
 
 
@@ -1200,11 +1039,20 @@ def build_side_by_side_alignment(script_text, words_data):
     # Build flat script token list with line indices
     script_tokens = []
     for line_idx, line in enumerate(script_lines):
-        for match in re.finditer(r"\S+", line):
-            raw = match.group(0)
-            clean = super_clean(raw)
-            if clean:
-                script_tokens.append({"text": raw, "clean": clean, "line": line_idx})
+        line = to_simplified(line)
+        if HAS_JIEBA:
+            words = jieba.cut(line)
+            for w in words:
+                clean = super_clean(w)
+                if clean:
+                    script_tokens.append({"text": w, "clean": clean, "line": line_idx})
+        else:
+            line_seg = re.sub(r'([\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7a3])', r' \1 ', line)
+            for match in re.finditer(r"\S+", line_seg):
+                raw = match.group(0)
+                clean = super_clean(raw)
+                if clean:
+                    script_tokens.append({"text": raw, "clean": clean, "line": line_idx})
 
     if not script_tokens and not trans_tokens:
         return []

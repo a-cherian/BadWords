@@ -18,7 +18,7 @@ import platform
 # ==========================================
 # APPLICATION INFO
 # ==========================================
-APP_NAME = "BadWords"
+APP_NAME = "BadWordsZH"
 VERSION = "3.0.5"
 POSTHOG_API_KEY = "phc_NRFaTKhPJJE8cBa3o9gXYo2mlktR5qup5tn7PdxuRsr"
 POSTHOG_HOST = "https://eu.i.posthog.com"
@@ -54,6 +54,10 @@ def FS(size):
 # ANALYSIS PARAMETERS
 # ==========================================
 DEFAULT_BAD_WORDS = ["yyy", "eee", "aaa", "umm", "uh", "ah", "mhm"]
+DEFAULT_BAD_WORDS_BY_LANG = {
+    "zh": ["嗯", "啊", "呃"],
+    "yue": ["嗯", "啊", "呃"],
+}
 SIMILARITY_THRESHOLD = 0.45
 
 # Default filler/hesitation initial prompt for Whisper transcription
@@ -297,8 +301,8 @@ def get_whisper_prompt_for_lang(lang, user_custom_prompt=None):
     Returns:
         str: The resolved initial prompt string.
     """
-    # 1. User has set a non-empty custom prompt — always respect it
-    if user_custom_prompt and user_custom_prompt.strip():
+    # 1. User has set a non-empty custom prompt (that is not the default GOLDEN baseline) — always respect it
+    if user_custom_prompt and user_custom_prompt.strip() and user_custom_prompt.strip() != GOLDEN_INITIAL_PROMPT:
         return user_custom_prompt.strip()
 
     # 2. Specific language selected — look up per-language prompt
