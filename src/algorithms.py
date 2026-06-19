@@ -580,7 +580,7 @@ class CompareEngine:
                     self.words_data[w_idx]['status'] = status
                     self.words_data[w_idx]['selected'] = True
                     self.words_data[w_idx]['is_auto'] = True
-
+        return self.words_data
 
 def compare_script_to_transcript(script_text, words_data, algo_settings=None):
     """
