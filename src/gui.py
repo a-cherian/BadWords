@@ -6497,6 +6497,20 @@ class SettingsDialog(FramelessWindowMixin, _BaseDialog):
             self.dropdown_compute.setText(saved_compute if saved_compute in _compute_items else 'Auto')
             _add_row(form_ai, self.txt("lbl_compute_type"), self.dropdown_compute, 'Auto', self.dropdown_compute.setValue)
 
+            self.chk_whisperjav = ToggleSwitch()
+            self.chk_whisperjav.setChecked(bool(prefs.get('ai_use_whisperjav_for_zh', True)), animated=False)
+            _add_row(form_ai, self.txt("lbl_use_whisperjav"), self.chk_whisperjav, True, lambda v: self.chk_whisperjav.setChecked(v, animated=False))
+
+            self.text_whisperjav_path = QLineEdit()
+            self.text_whisperjav_path.setText(prefs.get('ai_whisperjav_path', config.DEFAULT_SETTINGS.get('ai_whisperjav_path')))
+            self.text_whisperjav_path.setStyleSheet(f"background-color: #1e1e1e; color: #d4d4d4; border: 1px solid #3a3a3a; border-radius: 3px; padding: 4px; font-family: {config.UI_FONT_NAME}; font-size: 10pt;")
+            _add_row(form_ai, self.txt("lbl_whisperjav_path"), self.text_whisperjav_path, config.DEFAULT_SETTINGS.get('ai_whisperjav_path'), self.text_whisperjav_path.setText)
+
+            self.text_whisperjav_args = QLineEdit()
+            self.text_whisperjav_args.setText(prefs.get('ai_whisperjav_args', config.DEFAULT_SETTINGS.get('ai_whisperjav_args')))
+            self.text_whisperjav_args.setStyleSheet(f"background-color: #1e1e1e; color: #d4d4d4; border: 1px solid #3a3a3a; border-radius: 3px; padding: 4px; font-family: {config.UI_FONT_NAME}; font-size: 10pt;")
+            _add_row(form_ai, self.txt("lbl_whisperjav_args"), self.text_whisperjav_args, config.DEFAULT_SETTINGS.get('ai_whisperjav_args'), self.text_whisperjav_args.setText)
+
             l_ai.addLayout(form_ai)
             l_ai.addSpacing(14)
 
@@ -7301,6 +7315,9 @@ class SettingsDialog(FramelessWindowMixin, _BaseDialog):
                 'accent_color':       self._safe_get('dropdown_accent', old_prefs.get('accent_color', 'green'), 'currentText'),
                 'device':             self._safe_get('dropdown_device', old_prefs.get('device', 'auto').capitalize(), 'currentText').lower(),
                 'ai_compute_type':    self._safe_get('dropdown_compute', old_prefs.get('ai_compute_type', 'Auto'), 'currentText'),
+                'ai_use_whisperjav_for_zh': self._safe_get('chk_whisperjav', old_prefs.get('ai_use_whisperjav_for_zh', True), 'isChecked'),
+                'ai_whisperjav_path': self._safe_get('text_whisperjav_path', old_prefs.get('ai_whisperjav_path', config.DEFAULT_SETTINGS.get('ai_whisperjav_path')), 'text'),
+                'ai_whisperjav_args': self._safe_get('text_whisperjav_args', old_prefs.get('ai_whisperjav_args', config.DEFAULT_SETTINGS.get('ai_whisperjav_args')), 'text'),
                 'ai_initial_prompt':  self._safe_get('textedit_prompt', old_prefs.get('ai_initial_prompt', ''), 'toPlainText'),
                 'chunk_max_words':    self._safe_get('spin_chunk_max', old_prefs.get('chunk_max_words', 30), 'value'),
                 'chunk_lookahead':    self._safe_get('spin_chunk_look', old_prefs.get('chunk_lookahead', 3), 'value'),
@@ -7324,7 +7341,7 @@ class SettingsDialog(FramelessWindowMixin, _BaseDialog):
                 'ai_k_size':                self._safe_get('spin_k_size', old_prefs.get('ai_k_size', 5), 'value'),
             })
         else:
-            advanced_keys = ["always_on_top", "hidden_panels", "accent_color", "device", "ai_compute_type", "ai_initial_prompt", "chunk_max_words", "chunk_lookahead", "chunk_min_chars", "algo_fuzzy_threshold", "algo_retake_lookahead", "algo_distance_penalty", "algo_anchor_depth", "ai_vad_filter", "ai_beam_size", "ai_temperature", "ai_condition_on_prev", "ai_logprob_threshold", "ai_no_speech_threshold", "ai_patience", "ai_compression_ratio_threshold", "ai_no_repeat_ngram_size", "ai_regroup", "ai_suppress_silence", "ai_q_levels", "ai_k_size"]
+            advanced_keys = ["always_on_top", "hidden_panels", "accent_color", "device", "ai_compute_type", "ai_use_whisperjav_for_zh", "ai_whisperjav_path", "ai_whisperjav_args", "ai_initial_prompt", "chunk_max_words", "chunk_lookahead", "chunk_min_chars", "algo_fuzzy_threshold", "algo_retake_lookahead", "algo_distance_penalty", "algo_anchor_depth", "ai_vad_filter", "ai_beam_size", "ai_temperature", "ai_condition_on_prev", "ai_logprob_threshold", "ai_no_speech_threshold", "ai_patience", "ai_compression_ratio_threshold", "ai_no_repeat_ngram_size", "ai_regroup", "ai_suppress_silence", "ai_q_levels", "ai_k_size"]
             for key in advanced_keys:
                 if key in old_prefs:
                     state[key] = old_prefs[key]
@@ -7403,6 +7420,9 @@ class SettingsDialog(FramelessWindowMixin, _BaseDialog):
             self._safe_set('dropdown_accent', state.get('accent_color', 'green'), 'setText')
             self._safe_set('dropdown_device', state.get('device', 'Auto').capitalize(), 'setText')
             self._safe_set('dropdown_compute', state.get('ai_compute_type', 'Auto'), 'setText')
+            self._safe_set('chk_whisperjav', state.get('ai_use_whisperjav_for_zh', True), 'setChecked')
+            self._safe_set('text_whisperjav_path', state.get('ai_whisperjav_path', config.DEFAULT_SETTINGS.get('ai_whisperjav_path')), 'setText')
+            self._safe_set('text_whisperjav_args', state.get('ai_whisperjav_args', config.DEFAULT_SETTINGS.get('ai_whisperjav_args')), 'setText')
             self._safe_set('textedit_prompt', state.get('ai_initial_prompt', ''), 'setPlainText')
             self._safe_set('spin_chunk_max', state.get('chunk_max_words', 30), 'setValue')
             self._safe_set('spin_chunk_look', state.get('chunk_lookahead', 3), 'setValue')

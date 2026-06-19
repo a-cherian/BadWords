@@ -47,10 +47,67 @@ import traceback
 import platform
 import random
 import difflib  # Essential for on-the-fly fuzzy matching
+import shlex
+from datetime import timedelta
 
 import config
 import algorithms
 from osdoc import log_info, log_error
+
+def _parse_srt_time(time_str):
+    parts = re.split('[:,]', time_str)
+    return timedelta(hours=int(parts[0]), minutes=int(parts[1]), seconds=int(parts[2]), milliseconds=int(parts[3]))
+
+def _process_srt_to_json(srt_path, lang):
+    with open(srt_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+    
+    blocks = content.strip().split('\n\n')
+    parsed_subtitles = []
+    for block in blocks:
+        lines = block.split('\n')
+        if len(lines) >= 3:
+            try:
+                start_str, end_str = lines[1].split(' --> ')
+                start_sec = _parse_srt_time(start_str).total_seconds()
+                end_sec = _parse_srt_time(end_str).total_seconds()
+                text = '\n'.join(lines[2:])
+                parsed_subtitles.append({'start': start_sec, 'end': end_sec, 'text': text})
+            except Exception:
+                continue
+
+    if parsed_subtitles:
+        parsed_subtitles[0]['start'] = 0.0
+    for i in range(len(parsed_subtitles) - 1):
+        parsed_subtitles[i]['end'] = parsed_subtitles[i+1]['start']
+        
+    segments = []
+    for sub in parsed_subtitles:
+        text = sub['text'].replace('\n', ' ')
+        start = sub['start']
+        end = sub['end']
+        
+        chars = list(text)
+        words = []
+        if chars:
+            duration_per_char = (end - start) / len(chars)
+            for i, char in enumerate(chars):
+                w_start = start + i * duration_per_char
+                w_end = w_start + duration_per_char
+                words.append({
+                    "word": char,
+                    "start": w_start,
+                    "end": w_end,
+                    "probability": 1.0
+                })
+        
+        segments.append({
+            "start": start,
+            "end": end,
+            "text": text,
+            "words": words
+        })
+    return {"segments": segments, "language": lang}
 
 class AudioEngine:
     def __init__(self, os_doctor, resolve_handler):
@@ -423,6 +480,61 @@ except Exception as e:
 
         env = os.environ.copy()
         env["HF_HOME"] = self.models_dir
+        
+        # ── Whisperjav Interception for Chinese ─────────────────────────────
+        ai_use_whisperjav = prefs.get('ai_use_whisperjav_for_zh', True)
+        if ai_use_whisperjav and lang and str(lang).lower().strip() in ("zh", "yue", "zh-tw", "zh-cn"):
+            wj_path = os.path.expanduser(prefs.get('ai_whisperjav_path', config.DEFAULT_SETTINGS.get('ai_whisperjav_path', '~/venvs/whisperjav/bin/whisperjav')))
+            if os.path.exists(wj_path):
+                log_info(f"[Whisperjav] Intercepting transcription for language {lang}. Executing: {wj_path}")
+                wj_args_str = prefs.get('ai_whisperjav_args', config.DEFAULT_SETTINGS.get('ai_whisperjav_args', ''))
+                wj_args = shlex.split(wj_args_str)
+                
+                cmd = [wj_path, audio_path] + wj_args + ["--output-format", "srt", "--output-dir", output_dir]
+                
+                log_info(f"[Whisperjav] Command: {' '.join(cmd)}")
+                if progress_callback:
+                    progress_callback(self.os_doc.gui.txt("txt_transcribing_pct") if hasattr(self.os_doc, 'gui') else "Running Whisperjav (Qwen)...")
+                    
+                try:
+                    process = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        env=env
+                    )
+                    while True:
+                        line = process.stdout.readline()
+                        if not line and process.poll() is not None:
+                            break
+                        if line:
+                            line_str = line.strip()
+                            print(f"[Whisperjav] {line_str}")
+                            if progress_callback:
+                                # Try to catch tqdm progress percentages
+                                m = re.search(r'(\d{1,3})%', line_str)
+                                if m:
+                                    progress_callback(f"Running Whisperjav... {m.group(1)}%")
+                except Exception as e:
+                    log_error(f"Whisperjav failed: {e}")
+                    raise
+                
+                srt_file = os.path.join(output_dir, unique_name + ".srt")
+                if not os.path.exists(srt_file):
+                    log_error(f"Whisperjav finished but {srt_file} not found.")
+                    raise FileNotFoundError(f"Whisperjav output {srt_file} not found.")
+                    
+                if progress_callback:
+                    progress_callback("Processing Whisperjav output...")
+                json_data = _process_srt_to_json(srt_file, lang)
+                with open(json_output_path, 'w', encoding='utf-8') as f:
+                    json.dump(json_data, f, ensure_ascii=False, indent=2)
+                
+                log_info(f"[Whisperjav] Saved json output to {json_output_path}")
+                return json_output_path
+            else:
+                log_info(f"[Whisperjav] Executable not found at {wj_path}. Falling back to faster-whisper.")
         
         if self.os_doc.is_linux and fw_device == "cuda":
             nvidia_libs_paths = []
