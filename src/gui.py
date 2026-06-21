@@ -8853,6 +8853,10 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
             "current_chapter_idx": getattr(self, '_current_chapter_idx', -1),
             "script_content": getattr(self, 'text_script', None).toPlainText() if hasattr(self, 'text_script') else ""
         }
+        
+        if hasattr(self.engine, 'current_srt_content') and self.engine.current_srt_content:
+            data_packet["srt_content"] = self.engine.current_srt_content
+            data_packet["srt_name"] = self.engine.current_srt_name
         # Note: layout state is inside 'settings', not at the root level
         self.engine.save_project_state(path, data_packet)
 
@@ -8868,6 +8872,21 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
             if not path: return
             
             state, _ = self.engine.load_project_state(path)
+            
+            # Restore SRT if present
+            srt_content = state.get("srt_content")
+            srt_name = state.get("srt_name")
+            if srt_content and srt_name:
+                try:
+                    temp_dir = self.engine.os_doc.get_temp_folder()
+                    srt_path = os.path.join(temp_dir, srt_name)
+                    with open(srt_path, 'w', encoding='utf-8') as f:
+                        f.write(srt_content)
+                    self.engine.current_srt_content = srt_content
+                    self.engine.current_srt_name = srt_name
+                except Exception as e:
+                    from osdoc import log_error
+                    log_error(f"Failed to restore SRT: {e}")
 
             from PySide6.QtCore import QTimer
 
@@ -10376,6 +10395,7 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
             "filler_words": [w.strip() for w in self.txt_fillers.toPlainText().split(',') if w.strip()],
             "timeline_name": selected_tl_name or None,
             "track_indices": track_indices or None,
+            "ai_initial_prompt_override": self.text_script.toPlainText().strip() if hasattr(self, 'text_script') else "",
         }
 
         
@@ -10427,6 +10447,14 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
             self.lbl_first_run_hint.hide()
             if hasattr(self, '_hint_opacity'):
                 self._hint_opacity.setOpacity(0.0)
+
+        # NEW: Automatically propagate context file script into the analysis script field
+        if hasattr(self, 'text_script') and hasattr(self, 'textedit_prompt'):
+            if not self.text_script.toPlainText().strip():
+                context_text = self.textedit_prompt.toPlainText().strip()
+                # Ignore if it's the default placeholder strings
+                if context_text and context_text != config.DEFAULT_WHISPER_PROMPT and context_text != config.GOLDEN_INITIAL_PROMPT:
+                    self.text_script.setPlainText(context_text)
 
 
         if not words_data:

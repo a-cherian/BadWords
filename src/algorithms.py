@@ -456,7 +456,7 @@ class CompareEngine:
             if c1 == c2 and c1 != "": return 1.0
             if py1 == py2 and py1 != "": return 0.8
             if py1 and py2 and py1[0] == py2[0]: return 0.2
-            return 0.0
+            return -1.5
 
         def global_alignment(T_pys, S_pys, T_chars, S_chars):
             M = len(T_pys)
@@ -464,19 +464,27 @@ class CompareEngine:
             dp = [[0.0] * (N + 1) for _ in range(M + 1)]
             ptr = [[0] * (N + 1) for _ in range(M + 1)]
             
+            GAP_OPEN = -2.5
+            T_GAP_EXT = -0.5
+            S_GAP_EXT = -1.0
+            
             for i in range(1, M + 1):
-                dp[i][0] = i * -0.5
+                dp[i][0] = GAP_OPEN + i * T_GAP_EXT
                 ptr[i][0] = 1
             for j in range(1, N + 1):
-                dp[0][j] = j * -1.0
+                dp[0][j] = GAP_OPEN + j * S_GAP_EXT
                 ptr[0][j] = 2
                 
             for i in range(1, M + 1):
                 for j in range(1, N + 1):
                     score = char_match(T_pys[i-1], S_pys[j-1], T_chars[i-1], S_chars[j-1])
                     match = dp[i-1][j-1] + score
-                    delete = dp[i-1][j] - 0.5
-                    insert = dp[i][j-1] - 1.0
+                    
+                    delete = dp[i-1][j] + T_GAP_EXT
+                    if ptr[i-1][j] != 1: delete += GAP_OPEN
+                        
+                    insert = dp[i][j-1] + S_GAP_EXT
+                    if ptr[i][j-1] != 2: insert += GAP_OPEN
                     
                     best = max(match, delete, insert)
                     dp[i][j] = best
@@ -564,16 +572,30 @@ class CompareEngine:
                 next_match_T = []
                 for next_idx in range(idx + 1, len(blocks)):
                     if blocks[next_idx]['type'] == 'match':
-                        next_match_T = blocks[next_idx]['T_indices']
-                        break
+                        next_match_T.extend(blocks[next_idx]['T_indices'])
+                        if len(next_match_T) >= 30:
+                            break
                 
-                if len(next_match_T) > 0 and len(block['T_indices']) > 0:
+                prev_match_T = []
+                for prev_idx in range(idx - 1, -1, -1):
+                    if blocks[prev_idx]['type'] == 'match':
+                        prev_match_T = blocks[prev_idx]['T_indices'] + prev_match_T
+                        if len(prev_match_T) >= 30:
+                            break
+                
+                status = 'bad'
+                if len(block['T_indices']) > 0:
                     gap_pys = [T_pys[i] for i in block['T_indices']]
-                    anchor_pys = [T_pys[i] for i in next_match_T][:30]
-                    similarity = local_similarity(gap_pys, anchor_pys)
-                    status = 'repeat' if similarity > 0.5 else 'bad'
-                else:
-                    status = 'bad'
+                    
+                    if len(next_match_T) > 0:
+                        anchor_pys = [T_pys[i] for i in next_match_T][:30]
+                        if local_similarity(gap_pys, anchor_pys) > 0.5:
+                            status = 'repeat'
+                            
+                    if status != 'repeat' and len(prev_match_T) > 0:
+                        anchor_pys = [T_pys[i] for i in prev_match_T][-30:]
+                        if local_similarity(gap_pys, anchor_pys) > 0.5:
+                            status = 'repeat'
                     
                 for t_idx in block['T_indices']:
                     w_idx = word_mapping[t_idx]

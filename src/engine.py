@@ -55,26 +55,50 @@ import algorithms
 from osdoc import log_info, log_error
 
 def _parse_srt_time(time_str):
-    parts = re.split('[:,]', time_str)
-    return timedelta(hours=int(parts[0]), minutes=int(parts[1]), seconds=int(parts[2]), milliseconds=int(parts[3]))
+    import re
+    from datetime import timedelta
+    parts = re.split(r'[:,.]', time_str.strip())
+    try:
+        if len(parts) >= 4:
+            return timedelta(hours=int(parts[0]), minutes=int(parts[1]), seconds=int(parts[2]), milliseconds=int(parts[3]))
+        elif len(parts) == 3:
+            return timedelta(minutes=int(parts[0]), seconds=int(parts[1]), milliseconds=int(parts[2]))
+    except Exception as e:
+        log_error(f"_parse_srt_time error on '{time_str}': {e}")
+    return timedelta(0)
 
 def _process_srt_to_json(srt_path, lang):
+    import re
     with open(srt_path, 'r', encoding='utf-8') as f:
         content = f.read()
     
-    blocks = content.strip().split('\n\n')
+    blocks = re.split(r'\r?\n\r?\n', content.strip())
     parsed_subtitles = []
     for block in blocks:
-        lines = block.split('\n')
-        if len(lines) >= 3:
-            try:
-                start_str, end_str = lines[1].split(' --> ')
-                start_sec = _parse_srt_time(start_str).total_seconds()
-                end_sec = _parse_srt_time(end_str).total_seconds()
-                text = '\n'.join(lines[2:])
-                parsed_subtitles.append({'start': start_sec, 'end': end_sec, 'text': text})
-            except Exception:
-                continue
+        lines = [line.strip() for line in block.split('\n') if line.strip()]
+        if len(lines) >= 2:
+            # Find the time line (usually lines[1], but sometimes lines[0] if no index)
+            time_line = None
+            text_start_idx = 0
+            for i, line in enumerate(lines):
+                if '-->' in line:
+                    time_line = line
+                    text_start_idx = i + 1
+                    break
+            
+            if time_line:
+                try:
+                    start_str, end_str = time_line.split('-->')
+                    start_sec = _parse_srt_time(start_str.strip()).total_seconds()
+                    end_sec = _parse_srt_time(end_str.strip()).total_seconds()
+                    text = '\n'.join(lines[text_start_idx:])
+                    parsed_subtitles.append({'start': start_sec, 'end': end_sec, 'text': text})
+                except Exception as e:
+                    log_error(f"_process_srt_to_json parse error: {e}")
+                    continue
+
+    if not parsed_subtitles:
+        log_error(f"_process_srt_to_json: No subtitles parsed from {srt_path}!")
 
     if parsed_subtitles:
         parsed_subtitles[0]['start'] = 0.0
@@ -444,7 +468,7 @@ except Exception as e:
 
     def run_whisper(self, audio_path, model, lang, verbatim, device_mode, compute_type,
                     filler_words_list=None, initial_prompt=None, progress_callback=None,
-                    islands=None):
+                    islands=None, status_callback=None):
         """
         Modified v11.0: Uses stable-ts (stable_whisper) with faster-whisper backend.
         FIXED v11.2: Injects portable bin path to OS PATH for sub-dependencies.
@@ -480,6 +504,10 @@ except Exception as e:
 
         env = os.environ.copy()
         env["HF_HOME"] = self.models_dir
+        if hasattr(self, 'ffmpeg_cmd') and self.ffmpeg_cmd:
+            ffmpeg_dir = os.path.dirname(self.ffmpeg_cmd)
+            if ffmpeg_dir:
+                env["PATH"] = f"{ffmpeg_dir}{os.pathsep}{env.get('PATH', '')}"
         
         # ── Whisperjav Interception for Chinese ─────────────────────────────
         ai_use_whisperjav = prefs.get('ai_use_whisperjav_for_zh', True)
@@ -492,17 +520,46 @@ except Exception as e:
                 
                 cmd = [wj_path, audio_path] + wj_args + ["--output-format", "srt", "--output-dir", output_dir]
                 
+                if initial_prompt:
+                    context_path = os.path.join(output_dir, unique_name + "_context.txt")
+                    try:
+                        with open(context_path, 'w', encoding='utf-8') as f:
+                            f.write(initial_prompt)
+                        cmd += ["--qwen-context-file", context_path]
+                        log_info(f"[Whisperjav] Attached script context file: {context_path}")
+                    except Exception as e:
+                        log_error(f"[Whisperjav] Failed to write context file: {e}")
+                
                 log_info(f"[Whisperjav] Command: {' '.join(cmd)}")
                 if progress_callback:
-                    progress_callback(self.os_doc.gui.txt("txt_transcribing_pct") if hasattr(self.os_doc, 'gui') else "Running Whisperjav (Qwen)...")
+                    try:
+                        progress_callback(0)
+                    except:
+                        pass
                     
+                # Remove BadWords' custom HF_HOME so whisperjav uses the system default 
+                # (saving gigabytes of duplicated models in BadWords' internal cache)
+                wj_env = env.copy()
+                wj_env.pop("HF_HOME", None)
+                
+                total_scenes = 1
+                
+                # Tracking state for decoupled chunks
+                wj_global_total = 0
+                wj_completed_gen = 0
+                wj_last_curr_gen = 0
+                wj_last_tot_gen = 0
+                wj_completed_align = 0
+                wj_last_curr_align = 0
+                wj_last_tot_align = 0
+                
                 try:
                     process = subprocess.Popen(
                         cmd,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT,
                         text=True,
-                        env=env
+                        env=wj_env
                     )
                     while True:
                         line = process.stdout.readline()
@@ -513,20 +570,101 @@ except Exception as e:
                             print(f"[Whisperjav] {line_str}")
                             if progress_callback:
                                 # Try to catch tqdm progress percentages
-                                m = re.search(r'(\d{1,3})%', line_str)
-                                if m:
-                                    progress_callback(f"Running Whisperjav... {m.group(1)}%")
+                                m = re.search(r'\[\s*(\d+(?:\.\d+)?)%\s*\]|(\d+(?:\.\d+)?)%\|', line_str)
+                                if m and "Loading checkpoint shards" not in line_str:
+                                    try:
+                                        val_str = m.group(1) or m.group(2)
+                                        val = float(val_str)
+                                        progress_callback(int(val))
+                                    except:
+                                        pass
+                                
+                                # Try to catch DecoupledPipeline progress
+                                m_scenes = re.search(r'Processing (\d+) scenes', line_str)
+                                if m_scenes:
+                                    try:
+                                        total_scenes = max(1, int(m_scenes.group(1)))
+                                    except: pass
+                                
+                                m_global = re.search(r'Phase 2: Detected (\d+) scenes', line_str)
+                                if m_global:
+                                    try: wj_global_total = int(m_global.group(1))
+                                    except: pass
+
+                                m_gen = re.search(r'ASR Text Gen \| Scene (\d+)/(\d+)', line_str)
+                                if m_gen:
+                                    if status_callback:
+                                        try: status_callback("Transcribing...")
+                                        except: pass
+                                    try:
+                                        curr = int(m_gen.group(1))
+                                        tot = int(m_gen.group(2))
+                                        if curr < wj_last_curr_gen:
+                                            wj_completed_gen += wj_last_tot_gen
+                                        wj_last_curr_gen = curr
+                                        wj_last_tot_gen = tot
+                                        
+                                        if wj_global_total > 0:
+                                            pct = int(((wj_completed_gen + curr) / wj_global_total) * 50)
+                                        else:
+                                            pct = int((curr / tot) * 50)
+                                        
+                                        pct = min(50, max(0, pct))
+                                        progress_callback(pct)
+                                    except: pass
+
+                                m_align = re.search(r'Aligning \| Scen\w*\s+(\d+)/(\d+)', line_str)
+                                if m_align:
+                                    if status_callback:
+                                        try: status_callback("Aligning...")
+                                        except: pass
+                                    try:
+                                        curr = int(m_align.group(1))
+                                        tot = int(m_align.group(2))
+                                        if curr < wj_last_curr_align:
+                                            wj_completed_align += wj_last_tot_align
+                                        wj_last_curr_align = curr
+                                        wj_last_tot_align = tot
+
+                                        if wj_global_total > 0:
+                                            pct = 50 + int(((wj_completed_align + curr) / wj_global_total) * 49)
+                                        else:
+                                            pct = 50 + int((curr / tot) * 49)
+                                        
+                                        pct = min(100, max(50, pct))
+                                        progress_callback(pct)
+                                    except: pass
+
                 except Exception as e:
                     log_error(f"Whisperjav failed: {e}")
                     raise
                 
+                import glob
+                import shutil
+                srt_files = glob.glob(os.path.join(output_dir, unique_name + "*.srt"))
+                if not srt_files:
+                    log_error(f"Whisperjav finished but {unique_name}*.srt not found in {output_dir}.")
+                    raise FileNotFoundError(f"Whisperjav output {unique_name}*.srt not found.")
+                
+                actual_srt = srt_files[0]
                 srt_file = os.path.join(output_dir, unique_name + ".srt")
-                if not os.path.exists(srt_file):
-                    log_error(f"Whisperjav finished but {srt_file} not found.")
-                    raise FileNotFoundError(f"Whisperjav output {srt_file} not found.")
+                if actual_srt != srt_file:
+                    shutil.copy(actual_srt, srt_file)
                     
                 if progress_callback:
-                    progress_callback("Processing Whisperjav output...")
+                    try:
+                        progress_callback(100)
+                    except:
+                        pass
+                
+                # Store the generated SRT directly in engine so Export Project can save it
+                try:
+                    with open(srt_file, 'r', encoding='utf-8') as f:
+                        self.current_srt_content = f.read()
+                        self.current_srt_name = os.path.basename(srt_file)
+                except Exception as e:
+                    log_error(f"Failed to load generated SRT into engine memory: {e}")
+
                 json_data = _process_srt_to_json(srt_file, lang)
                 with open(json_output_path, 'w', encoding='utf-8') as f:
                     json.dump(json_data, f, ensure_ascii=False, indent=2)
@@ -1364,7 +1502,7 @@ except Exception as e:
             # Stage 6A: Prefer user-saved ai_compute_type from settings; auto-detect as fallback
             saved_prefs     = self.os_doc.get_all_prefs()
             saved_compute        = saved_prefs.get('ai_compute_type', '')
-            user_custom_prompt   = saved_prefs.get('ai_initial_prompt', '').strip()
+            user_custom_prompt   = settings.get('ai_initial_prompt_override', '') or saved_prefs.get('ai_initial_prompt', '').strip()
             # Per-language prompt selection: respects custom user prompt first,
             # then falls back to a language-specific verbatim prompt, then GOLDEN baseline.
             # lang is resolved above (None = auto-detect, str = specific language code)
@@ -1542,6 +1680,7 @@ except Exception as e:
                 initial_prompt=ai_initial_prompt,
                 progress_callback=whisper_live_progress,
                 islands=islands,
+                status_callback=update_status
             )
             
             if not json_path:
@@ -1563,6 +1702,15 @@ except Exception as e:
             update_status(self.txt("status_process"))
             with open(json_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
+
+            srt_path = json_path.rsplit('.', 1)[0] + ".srt"
+            if os.path.exists(srt_path):
+                try:
+                    with open(srt_path, 'r', encoding='utf-8') as f:
+                        self.current_srt_content = f.read()
+                        self.current_srt_name = os.path.basename(srt_path)
+                except Exception as e:
+                    log_error(f"Failed to read SRT: {e}")
 
             words_data, segments_data = self._build_data_structure(
                 data, silence_ranges, filler_words, fps, 
@@ -1781,6 +1929,26 @@ except Exception as e:
         raw_global_silence = scaled_silence
         silence_ranges = scaled_silence
         
+        # --- SILENCE PRECEDENCE LOGIC ---
+        # If words are smeared across silences (e.g. from whisperjav),
+        # we strictly carve out the words so the perfect silences can breathe.
+        if silence_ranges and temp_words:
+            for w in temp_words:
+                for s in silence_ranges:
+                    if s['s'] < w['end'] and s['e'] > w['start']:
+                        # Silence completely engulfs word
+                        if s['s'] <= w['start'] and s['e'] >= w['end']:
+                            w['end'] = w['start'] + 0.01
+                        # Silence overlaps the end
+                        elif s['s'] > w['start'] and s['e'] >= w['end']:
+                            w['end'] = s['s']
+                        # Silence overlaps the start
+                        elif s['s'] <= w['start'] and s['e'] < w['end']:
+                            w['start'] = s['e']
+                        # Silence strictly inside word
+                        elif s['s'] > w['start'] and s['e'] < w['end']:
+                            w['end'] = s['s']
+
         final_words = []
         
         if silence_ranges and temp_words and silence_ranges[0]['e'] < temp_words[0]['start']:
@@ -2361,6 +2529,85 @@ except Exception as e:
                             actual_name = new_tl.GetName()
                             log_info(f"assemble_timeline: XML import OK → '{actual_name}'")
                             xml_tl_name = actual_name
+
+                            # ── Auto-Inject Whisperjav SRT ────────────────────
+                            if hasattr(new_tl, 'ImportIntoTimeline'):
+                                srt_path = None
+                                if hasattr(self, 'current_srt_name') and self.current_srt_name:
+                                    srt_path = os.path.join(self.os_doc.get_temp_folder(), self.current_srt_name)
+                                    log_info(f"assemble_timeline: Found current_srt_name '{self.current_srt_name}', path={srt_path}")
+
+                                # NEW: Dynamically generate SRT from loaded words if it's missing!
+                                if not srt_path or not os.path.exists(srt_path):
+                                    if words_data:
+                                        log_info("assemble_timeline: Generating missing SRT from loaded project words...")
+                                        try:
+                                            audio_path = getattr(self.os_doc.gui, 'loaded_audio_path', 'recovered') if hasattr(self.os_doc, 'gui') else 'recovered'
+                                            srt_name = os.path.splitext(os.path.basename(audio_path))[0] + "_recovered.srt"
+                                            srt_path = os.path.join(self.os_doc.get_temp_folder(), srt_name)
+                                            
+                                            with open(srt_path, 'w', encoding='utf-8') as f:
+                                                def fmt_time(sec):
+                                                    h = int(sec // 3600)
+                                                    m = int((sec % 3600) // 60)
+                                                    s = int(sec % 60)
+                                                    ms = int(round((sec - int(sec)) * 1000))
+                                                    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+                                                
+                                                segments = {}
+                                                for w in words_data:
+                                                    if w.get('type') != 'word' or not w.get('text'): continue
+                                                    seg_k = w.get('seg_start', w.get('start', 0.0))
+                                                    if seg_k not in segments:
+                                                        segments[seg_k] = {'start': seg_k, 'end': w.get('seg_end', w.get('end', 0.0)), 'texts': []}
+                                                    segments[seg_k]['texts'].append(w['text'])
+                                                    segments[seg_k]['end'] = max(segments[seg_k]['end'], w.get('end', 0.0))
+                                                
+                                                for i, (seg_k, seg) in enumerate(sorted(segments.items())):
+                                                    f.write(f"{i+1}\n")
+                                                    f.write(f"{fmt_time(seg['start'])} --> {fmt_time(seg['end'])}\n")
+                                                    f.write("".join(seg['texts']) + "\n\n")
+                                            
+                                            log_info(f"assemble_timeline: Generated SRT at {srt_path}")
+                                            self.current_srt_name = srt_name
+                                        except Exception as e:
+                                            log_error(f"assemble_timeline: Failed to generate SRT from words: {e}")
+                                            srt_path = None
+                                
+                                if not srt_path or not os.path.exists(srt_path):
+                                    import glob
+                                    temp_dir = self.os_doc.get_temp_folder()
+                                    srt_files = glob.glob(os.path.join(temp_dir, "*.srt"))
+                                    if srt_files:
+                                        srt_path = max(srt_files, key=os.path.getmtime)
+                                        log_info(f"assemble_timeline: Fallback to newest temp SRT: {srt_path}")
+
+                                exists = os.path.exists(srt_path) if srt_path else False
+                                log_info(f"assemble_timeline: Final SRT path to inject: {srt_path} (Exists: {exists})")
+
+                                if srt_path and exists:
+                                    try:
+                                        self.resolve_handler.project.SetCurrentTimeline(new_tl)
+                                        success = new_tl.ImportIntoTimeline(srt_path)
+                                        if success:
+                                            log_info(f"assemble_timeline: Successfully injected SRT from {srt_path}")
+                                        else:
+                                            log_info("assemble_timeline: Failed to inject SRT via ImportIntoTimeline.")
+                                            # API rejected it. Drop a copy to the Desktop for manual import.
+                                            desktop_path = os.path.expanduser("~/Desktop")
+                                            dest_srt = os.path.join(desktop_path, "BadWords_Recovered_Subtitles.srt")
+                                            import shutil
+                                            try:
+                                                shutil.copy(srt_path, dest_srt)
+                                                log_info(f"assemble_timeline: Dropped SRT to Desktop: {dest_srt}")
+                                                # Auto-import into DaVinci Media Pool
+                                                if hasattr(self, 'resolve_handler') and self.resolve_handler and self.resolve_handler.media_pool:
+                                                    self.resolve_handler.media_pool.ImportMedia([dest_srt])
+                                                    log_info(f"assemble_timeline: Imported SRT into Media Pool: {dest_srt}")
+                                            except Exception as e:
+                                                log_error(f"assemble_timeline: Failed to copy or import SRT to {dest_srt}: {e}")
+                                    except Exception as e:
+                                        log_error(f"assemble_timeline: Exception injecting SRT: {e}")
 
                             # Move timeline directly into BadWords/ root bin (no Edits subfolder).
                             bw_bin = self.resolve_handler.get_badwords_root_bin()

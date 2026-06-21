@@ -1097,6 +1097,17 @@ class ResolveHandler:
                         _set('in',       new_src_in)
                         _set('out',      new_src_out)
 
+                        # Fix for Resolve freeze: ensure <file><duration> is >= <out>
+                        f_el_patch = new_ci.find('file')
+                        if f_el_patch is not None:
+                            f_dur_el = f_el_patch.find('duration')
+                            if f_dur_el is not None and f_dur_el.text:
+                                try:
+                                    if new_src_out > int(f_dur_el.text):
+                                        f_dur_el.text = str(new_src_out)
+                                except ValueError:
+                                    pass
+
                         # ── Strip invalid file references ──────────────────────────────
                         # Non-file-backed clips (adjustment clips, generators, etc.) have
                         # a <pathurl> pointing to an internal Resolve resource that doesn't
