@@ -1425,8 +1425,11 @@ except Exception as e:
                     settings.get('timeline_name') or self.resolve_handler.timeline.GetName(),
                     track_indices_for_render
                 )
-                if end_seconds:
+                if self.resolve_handler:
                     fps = self.resolve_handler.fps or 60.0
+                else:
+                    fps = getattr(self, '_cli_fps', 24.0)
+                if end_seconds:
                     end_frame_override = int(round(end_seconds * fps))
                     log_info(f"transcribe_audio: render end_frame_override={end_frame_override} ({end_seconds:.2f}s)")
 
@@ -1529,9 +1532,14 @@ except Exception as e:
                     padded_silences.append({'s': new_start, 'e': new_end})
 
             # --- Compute audio duration from Resolve timeline ---
-            fps = self.resolve_handler.fps
-            tl_start = self.resolve_handler.get_timeline_start_frame()
-            tl_end = self.resolve_handler.timeline.GetEndFrame()
+            if self.resolve_handler:
+                fps = self.resolve_handler.fps
+                tl_start = self.resolve_handler.get_timeline_start_frame()
+                tl_end = self.resolve_handler.timeline.GetEndFrame()
+            else:
+                fps = getattr(self, '_cli_fps', 24.0)
+                tl_start = 0
+                tl_end = 86400 * fps
             duration_s = (tl_end - tl_start) / fps
 
             # Single fake word that spans the entire audio;
@@ -1635,7 +1643,9 @@ except Exception as e:
                     log_info(f"[Compute] Auto (CPU): {fw_compute}")
 
             filler_words = settings.get('filler_words', [])
-            fps = self.resolve_handler.fps
+            fps = getattr(self, '_cli_fps', 24.0)
+            if self.resolve_handler:
+                fps = self.resolve_handler.fps
             txt_inaudible = "inaudible"
             
             USE_SLOW_MODE = True 
@@ -1662,7 +1672,10 @@ except Exception as e:
                     return None, err_msg
                 
                 if _end_s:
-                    _fps = self.resolve_handler.fps or 60.0
+                    if self.resolve_handler:
+                        _fps = self.resolve_handler.fps or 60.0
+                    else:
+                        _fps = getattr(self, '_cli_fps', 24.0)
                     end_frame_override_tx = int(round(_end_s * _fps))
                     log_info(f"transcribe_audio: render end_frame_override={end_frame_override_tx} ({_end_s:.2f}s)")
 
@@ -1679,8 +1692,9 @@ except Exception as e:
                 except Exception as _di_err:
                     log_info(f"[DirectAudio] Inspection error (harmless, using render): {_di_err}")
 
-            wav_path = None
-            if direct_info:
+            wav_path = settings.get('audio_path')
+            
+            if not wav_path and direct_info:
                 _direct_wav = os.path.join(temp_dir, f"{unique_id}_direct.wav")
                 ok_direct = self._extract_audio_direct(
                     direct_info, _direct_wav,
@@ -1696,13 +1710,17 @@ except Exception as e:
             if not wav_path:
                 update_status(self.txt("status_render"))
                 update_progress(-1)  # Indeterminate infinite progress bar
-
-                wav_path = self.resolve_handler.render_audio(
-                    unique_id, temp_dir,
-                    timeline_name=settings.get('timeline_name'),
-                    track_indices=track_indices_for_render,
-                    end_frame_override=end_frame_override_tx,
-                )
+                
+                if self.resolve_handler:
+                    wav_path = self.resolve_handler.render_audio(
+                        unique_id, temp_dir,
+                        timeline_name=settings.get('timeline_name'),
+                        track_indices=track_indices_for_render,
+                        end_frame_override=end_frame_override_tx,
+                    )
+                else:
+                    log_error("No resolve_handler provided and no audio_path given. Cannot render audio.")
+                    return None, None
             if not wav_path:
                 log_error("Render failed.")
                 return None, None
@@ -1840,6 +1858,17 @@ except Exception as e:
                             mf.write("1")
                 except Exception as e:
                     log_error(f"Failed to save model init marker: {e}")
+
+            if settings.get('skip_assembly'):
+                log_info("skip_assembly is True. Halting pipeline before DaVinci Resolve injection.")
+                return words_data, segments_data
+
+            result = self.assemble_timeline(
+                words_data,
+                settings,
+                callback_status=update_status,
+                callback_progress=update_progress
+            )
 
             update_progress(100)
             return words_data, segments_data
