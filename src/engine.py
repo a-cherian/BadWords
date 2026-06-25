@@ -2694,6 +2694,11 @@ except Exception as e:
                             actual_name = new_tl.GetName()
                             log_info(f"assemble_timeline: XML import OK → '{actual_name}'")
                             xml_tl_name = actual_name
+                            
+                            # Add an empty subtitle track to the new timeline so the user can easily drag the SRT onto it
+                            if hasattr(new_tl, 'AddTrack'):
+                                log_info("assemble_timeline: Adding empty subtitle track to the new timeline...")
+                                new_tl.AddTrack("subtitle")
 
                             # ── Auto-Inject Whisperjav SRT ────────────────────
                             if hasattr(new_tl, 'ImportIntoTimeline'):
@@ -2963,6 +2968,12 @@ except Exception as e:
 
                 new_tl_name = fb_tl_name
                 log_info(f"assemble_timeline: Fallback succeeded → '{new_tl_name}'")
+                
+                # Add an empty subtitle track to the fallback timeline
+                curr_tl = self.resolve_handler.get_current_timeline()
+                if curr_tl and hasattr(curr_tl, 'AddTrack'):
+                    log_info("assemble_timeline: Adding empty subtitle track to the fallback timeline...")
+                    curr_tl.AddTrack("subtitle")
 
             # ── Return to Edit page & cleanup ─────────────────────────────────
             try:
