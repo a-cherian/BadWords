@@ -201,7 +201,9 @@ def _process_srt_to_json(srt_path, lang, time_scale=1.0):
                 "word": "[SILENCE]",
                 "start": orig_start,
                 "end": orig_end,
-                "probability": 1.0
+                "probability": 1.0,
+                "type": "silence",
+                "status": "silence"
             })
         elif chars:
             duration_per_char = (orig_end - orig_start) / len(chars) if len(chars) > 0 else 0
@@ -2072,7 +2074,8 @@ except Exception as e:
                  final_words.append({
                      "start": s_start, "end": s_end, "text": "[SILENCE]",
                      "type": "silence", "status": "silence", "selected": False,
-                     "seg_start": 0, "seg_end": 0, "is_segment_start": False
+                     "seg_start": 0, "seg_end": 0, "is_segment_start": False,
+                     "words": [{"word": "[SILENCE]", "start": s_start, "end": s_end, "probability": 1.0, "type": "silence", "status": "silence"}]
                  })
 
         if temp_words:
