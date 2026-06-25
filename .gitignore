@@ -29,6 +29,8 @@ dev.json
 # Downloaded binaries and libs
 libs/
 models/
+src/models/
+src/temp/
 saves/
 ffmpeg_win.zip
 ffmpeg_static.tar.xz
