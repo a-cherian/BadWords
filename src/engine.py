@@ -2489,6 +2489,12 @@ except Exception as e:
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 project_state = json.load(f)
+
+            # CLI-generated JSON is a plain list of word dicts (not a project state dict).
+            # Wrap it so the rest of the pipeline treats it uniformly.
+            if isinstance(project_state, list):
+                log_info("load_project_state: detected CLI-generated flat words list — wrapping.")
+                project_state = {"words_data": project_state}
             
             words = project_state.get("words_data", [])
             segments = self._reconstruct_segments(words)

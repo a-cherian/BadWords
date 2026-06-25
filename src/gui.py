@@ -5008,7 +5008,262 @@ class UpdateNotifyDialog(FramelessWindowMixin, _BaseDialog):
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# OFFSET ALIGNMENT DIALOG  (shown when importing a CLI-generated JSON)
+# ---------------------------------------------------------------------------
+
+class OffsetAlignmentDialog(FramelessWindowMixin, _BaseDialog):
+    """
+    Lets the user specify a seconds-offset to apply to all JSON timestamps
+    so that a CLI-generated file (timestamped from 0 s) stays in sync with
+    audio that has been repositioned / trimmed inside a DaVinci Resolve timeline.
+
+    Returns:
+        offset_seconds  – float, via self.offset property after exec()
+        (0.0 means no adjustment)
+    """
+
+    def __init__(self, parent, resolve_handler=None):
+        super().__init__(parent)
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import (QVBoxLayout, QHBoxLayout, QLabel,
+                                        QPushButton, QDoubleSpinBox, QFrame,
+                                        QGraphicsDropShadowEffect)
+        from PySide6.QtGui import QColor
+
+        self._offset = 0.0
+        self._resolve_handler = resolve_handler
+
+        self.frameless_init(is_popup=True)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint | Qt.Dialog)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+
+        self.setStyleSheet(f"""
+            QDialog {{ background-color: transparent; }}
+            #MainInnerFrame {{
+                background-color: {config.BG_COLOR};
+                border: 1px solid #222;
+                border-radius: 10px;
+            }}
+            QLabel {{ color: {config.FG_COLOR}; }}
+            QLabel#lbl_title  {{ font-size: 13pt; font-weight: bold; }}
+            QLabel#lbl_sub    {{ font-size: 10pt; color: #888; }}
+            QLabel#lbl_field  {{ font-size: 10pt; }}
+            QDoubleSpinBox {{
+                background: {config.BTN_GHOST_BG};
+                color: {config.FG_COLOR};
+                border: 1px solid #444;
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-size: 11pt;
+                min-width: 100px;
+            }}
+            QPushButton {{
+                background-color: {config.BTN_GHOST_BG};
+                color: {config.BTN_FG};
+                padding: 6px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{ background-color: {config.BTN_GHOST_ACTIVE}; }}
+            QPushButton#btn_detect {{
+                background-color: #2a4a6a;
+                color: #8ec8ff;
+                border: 1px solid #3a6a9a;
+            }}
+            QPushButton#btn_detect:hover {{ background-color: #3a5a7a; }}
+            QPushButton#btn_ok {{
+                background-color: {config.BTN_BG};
+                color: {config.BTN_FG};
+            }}
+            QPushButton#btn_ok:hover {{ background-color: {config.BTN_ACTIVE}; }}
+        """)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(15, 15, 15, 15)
+
+        self.inner_frame = QFrame(self)
+        self.inner_frame.setObjectName("MainInnerFrame")
+
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(30)
+        shadow.setColor(QColor(0, 0, 0, 160))
+        shadow.setOffset(0, 0)
+        self.inner_frame.setGraphicsEffect(shadow)
+        outer.addWidget(self.inner_frame)
+
+        root_layout = QVBoxLayout(self.inner_frame)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        self._tb = CustomTitleBar(self, "en", parent=self.inner_frame)
+        if _HAS_QFRAMELESS and getattr(self, '_is_win', False) and hasattr(self, 'setTitleBar'):
+            self.setTitleBar(self._tb)
+        self._tb.btn_min.hide()
+        self._tb.btn_max.hide()
+        root_layout.addWidget(self._tb)
+
+        content = QVBoxLayout()
+        content.setContentsMargins(24, 20, 24, 24)
+        content.setSpacing(12)
+        root_layout.addLayout(content)
+
+        lbl_title = QLabel("🎯 Audio Sync Offset")
+        lbl_title.setObjectName("lbl_title")
+        content.addWidget(lbl_title)
+
+        lbl_sub = QLabel(
+            "This JSON was generated offline. If the audio clip was repositioned\n"
+            "or trimmed in your timeline, enter the exact offset below so that\n"
+            "the timestamps stay in perfect sync after import."
+        )
+        lbl_sub.setObjectName("lbl_sub")
+        lbl_sub.setWordWrap(True)
+        content.addWidget(lbl_sub)
+
+        content.addSpacing(4)
+
+        # ── Auto-detect row ───────────────────────────────────────────────────
+        detect_row = QHBoxLayout()
+        detect_row.setSpacing(8)
+
+        self.btn_detect = QPushButton("⚡ Auto-Detect from Playhead")
+        self.btn_detect.setObjectName("btn_detect")
+        self.btn_detect.setToolTip(
+            "Park the Resolve playhead over the synced audio clip, then click here.\n"
+            "The script reads the clip's timeline position and left-trim to compute the offset."
+        )
+        self.btn_detect.clicked.connect(self._auto_detect)
+        detect_row.addWidget(self.btn_detect)
+        detect_row.addStretch()
+
+        if not resolve_handler or not resolve_handler.timeline:
+            self.btn_detect.setEnabled(False)
+            self.btn_detect.setToolTip("DaVinci Resolve is not connected.")
+
+        content.addLayout(detect_row)
+
+        # ── Manual offset input ───────────────────────────────────────────────
+        field_row = QHBoxLayout()
+        field_row.setSpacing(10)
+
+        lbl_field = QLabel("Offset (seconds):")
+        lbl_field.setObjectName("lbl_field")
+        field_row.addWidget(lbl_field)
+
+        self.spin = QDoubleSpinBox()
+        self.spin.setRange(-36000.0, 36000.0)
+        self.spin.setDecimals(3)
+        self.spin.setSingleStep(0.1)
+        self.spin.setValue(0.0)
+        self.spin.setPrefix("+ " if self.spin.value() >= 0 else "")
+        self.spin.valueChanged.connect(lambda v: self.spin.setPrefix("+ " if v >= 0 else ""))
+        field_row.addWidget(self.spin)
+        field_row.addStretch()
+
+        content.addLayout(field_row)
+        content.addSpacing(4)
+
+        # ── Hint ─────────────────────────────────────────────────────────────
+        lbl_hint = QLabel(
+            "Tip: A positive offset shifts all cuts later in the timeline.\n"
+            "Set to 0.000 to import the JSON as-is with no adjustment."
+        )
+        lbl_hint.setObjectName("lbl_sub")
+        lbl_hint.setWordWrap(True)
+        content.addWidget(lbl_hint)
+
+        content.addSpacing(8)
+
+        # ── Buttons ───────────────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+
+        btn_skip = QPushButton("No Offset")
+        btn_skip.clicked.connect(self._on_skip)
+        btn_row.addWidget(btn_skip)
+
+        btn_row.addSpacing(8)
+
+        btn_ok = QPushButton("Apply & Import")
+        btn_ok.setObjectName("btn_ok")
+        btn_ok.clicked.connect(self._on_ok)
+        btn_row.addWidget(btn_ok)
+
+        content.addLayout(btn_row)
+
+        self.adjustSize()
+        _center_on_screen(self, self.width(), self.height())
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    @property
+    def offset(self):
+        return self._offset
+
+    def _auto_detect(self):
+        """
+        Calculate offset = (clip_tl_start - timeline_start - clip_left_trim) / fps.
+
+        Parks the playhead → finds the first audio clip that the playhead
+        overlaps → reads its timeline position and left-trim.
+        """
+        try:
+            rh  = self._resolve_handler
+            tl  = rh.timeline
+            fps = rh.fps or 24.0
+
+            tl_start = int(tl.GetStartFrame())
+
+            # Current playhead position
+            try:
+                ph_frame = int(tl.GetCurrentTimecode()) if hasattr(tl, 'GetCurrentTimecode') else tl_start
+            except Exception:
+                ph_frame = tl_start
+
+            found = False
+            track_count = tl.GetTrackCount("audio")
+            for ti in range(1, track_count + 1):
+                items = tl.GetItemListInTrack("audio", ti) or []
+                for item in items:
+                    clip_start = int(item.GetStart())
+                    clip_end   = clip_start + int(item.GetDuration())
+                    # Match the clip the playhead is over (or just grab the first clip)
+                    if clip_start <= ph_frame <= clip_end or not found:
+                        left_trim = int(item.GetLeftOffset())
+                        # offset_s = (timeline_position - left_trim) / fps
+                        offset_s = (clip_start - tl_start - left_trim) / fps
+                        self.spin.setValue(round(offset_s, 3))
+                        found = True
+                        if clip_start <= ph_frame <= clip_end:
+                            break  # exact match, stop
+                if found and tl_start <= ph_frame:
+                    break
+
+            if not found:
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.warning(self, "No clip found",
+                                    "No audio clips were found on the timeline.\n"
+                                    "Please check your timeline or enter the offset manually.")
+        except Exception as e:
+            from osdoc import log_error
+            log_error(f"OffsetAlignmentDialog auto-detect error: {e}")
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Error", f"Auto-detect failed:\n{e}")
+
+    def _on_ok(self):
+        self._offset = self.spin.value()
+        self.accept()
+
+    def _on_skip(self):
+        self._offset = 0.0
+        self.accept()
+
+
 class MarkerDialog(FramelessWindowMixin, _BaseDialog):
+
 
     """
     Custom frameless dialog for adding or editing a custom marker.
@@ -8876,7 +9131,35 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
             if not path: return
             
             state, _ = self.engine.load_project_state(path)
-            
+
+            # ── Audio Sync Offset (CLI-generated JSONs) ────────────────────────────
+            # A CLI-generated file has no 'srt_content' and no 'settings' dict
+            # because it was produced outside of Resolve.  Show the offset dialog
+            # so the user can compensate for audio repositioning in the timeline.
+            is_cli_json = ('words_data' in state) and ('srt_content' not in state) and (not state.get('settings'))
+            if is_cli_json:
+                try:
+                    dlg = OffsetAlignmentDialog(
+                        self,
+                        resolve_handler=getattr(self.engine, 'resolve_handler', None)
+                    )
+                    dlg.exec()
+                    offset_s = dlg.offset
+                except Exception as _dlg_err:
+                    from osdoc import log_error
+                    log_error(f"OffsetAlignmentDialog error: {_dlg_err}")
+                    offset_s = 0.0
+
+                if offset_s != 0.0:
+                    from osdoc import log_info
+                    log_info(f"Applying JSON sync offset of {offset_s:+.3f}s to all word timestamps")
+                    words = state.get('words_data', [])
+                    for w in words:
+                        for key in ('s', 'e', 'start', 'end'):
+                            if key in w and isinstance(w[key], (int, float)):
+                                w[key] = max(0.0, w[key] + offset_s)
+                    state['words_data'] = words
+
             # Restore SRT if present
             srt_content = state.get("srt_content")
             srt_name = state.get("srt_name")
