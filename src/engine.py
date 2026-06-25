@@ -171,12 +171,16 @@ def _process_srt_to_json(srt_path, lang, time_scale=1.0):
             return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
 
         with open(srt_path, 'w', encoding='utf-8') as f:
-            for i, sub in enumerate(parsed_subtitles):
+            srt_idx = 1
+            for sub in parsed_subtitles:
+                if sub['text'].strip() == '[SILENCE]':
+                    continue
                 o_start = sub.get('orig_start', sub['start']) * time_scale
                 o_end = sub.get('orig_end', sub['end']) * time_scale
-                f.write(f"{i+1}\n")
+                f.write(f"{srt_idx}\n")
                 f.write(f"{format_time(o_start)} --> {format_time(o_end)}\n")
                 f.write(f"{sub['text']}\n\n")
+                srt_idx += 1
     except Exception as e:
         log_error(f"Failed to overwrite SRT with original timings: {e}")
 
@@ -2816,6 +2820,8 @@ except Exception as e:
                                                     
                                                     if new_end - new_start > 0.05:
                                                         text = '\n'.join(lines[text_start_idx:])
+                                                        if text.strip() == '[SILENCE]':
+                                                            continue
                                                         new_blocks.append({
                                                             'start': new_start,
                                                             'end': new_end,
