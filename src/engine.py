@@ -67,7 +67,7 @@ def _parse_srt_time(time_str):
         log_error(f"_parse_srt_time error on '{time_str}': {e}")
     return timedelta(0)
 
-def _process_srt_to_json(srt_path, lang):
+def _process_srt_to_json(srt_path, lang, time_scale=1.0):
     import re
     with open(srt_path, 'r', encoding='utf-8') as f:
         content = f.read()
@@ -100,23 +100,113 @@ def _process_srt_to_json(srt_path, lang):
     if not parsed_subtitles:
         log_error(f"_process_srt_to_json: No subtitles parsed from {srt_path}!")
 
-    if parsed_subtitles:
-        parsed_subtitles[0]['start'] = 0.0
+    # Save original timings for accurate word interpolation and SRT generation
+    for sub in parsed_subtitles:
+        sub['orig_start'] = sub['start']
+        sub['orig_end'] = sub['end']
+
+    # Smart gap stretching with [SILENCE] injection
+    # Fetch user preferences for dynamic threshold and padding
+    try:
+        from osdoc import OSDoctor
+        prefs = OSDoctor().get_all_prefs() or {}
+        threshold = float(prefs.get('silence_min_dur', 1.0))
+        padding_head = float(prefs.get('pad', 0.3))
+        padding_tail = float(prefs.get('pad', 0.3))
+    except Exception as e:
+        log_error(f"Failed to load preferences for padding: {e}")
+        padding_head = 0.3
+        padding_tail = 0.3
+        threshold = 1.0
+
+    new_subtitles = []
+    
+    # Handle beginning silence
+    if parsed_subtitles and parsed_subtitles[0]['start'] > 0.0:
+        first_start = parsed_subtitles[0]['start']
+        if first_start >= threshold:
+            silence_end = first_start - padding_head
+            if silence_end > 0.0:
+                new_subtitles.append({
+                    'start': 0.0,
+                    'end': silence_end,
+                    'orig_start': 0.0,
+                    'orig_end': first_start,
+                    'text': '[SILENCE]'
+                })
+
     for i in range(len(parsed_subtitles) - 1):
-        parsed_subtitles[i]['end'] = parsed_subtitles[i+1]['start']
+        curr = parsed_subtitles[i]
+        nxt = parsed_subtitles[i+1]
         
+        new_subtitles.append(curr)
+        
+        gap = nxt['start'] - curr['end']
+        if gap >= threshold:
+            silence_start = curr['end'] + padding_tail
+            silence_end = nxt['start'] - padding_head
+            if silence_end > silence_start:
+                new_subtitles.append({
+                    'start': silence_start,
+                    'end': silence_end,
+                    'orig_start': curr['orig_end'],
+                    'orig_end': nxt['orig_start'],
+                    'text': '[SILENCE]'
+                })
+
+    if parsed_subtitles:
+        new_subtitles.append(parsed_subtitles[-1])
+        
+    parsed_subtitles = new_subtitles
+
+    # Overwrite the original SRT with the accurate original timings so DaVinci imports it perfectly accurate
+    try:
+        from datetime import timedelta
+        def format_time(s):
+            td = timedelta(seconds=s)
+            total_milliseconds = int(td.total_seconds() * 1000)
+            hours, remainder = divmod(total_milliseconds, 3_600_000)
+            minutes, remainder = divmod(remainder, 60_000)
+            seconds, milliseconds = divmod(remainder, 1_000)
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
+
+        with open(srt_path, 'w', encoding='utf-8') as f:
+            for i, sub in enumerate(parsed_subtitles):
+                o_start = sub.get('orig_start', sub['start']) * time_scale
+                o_end = sub.get('orig_end', sub['end']) * time_scale
+                f.write(f"{i+1}\n")
+                f.write(f"{format_time(o_start)} --> {format_time(o_end)}\n")
+                f.write(f"{sub['text']}\n\n")
+    except Exception as e:
+        log_error(f"Failed to overwrite SRT with original timings: {e}")
+
     segments = []
     for sub in parsed_subtitles:
         text = sub['text'].replace('\n', ' ')
         start = sub['start']
         end = sub['end']
+        orig_start = sub.get('orig_start', start)
+        orig_end = sub.get('orig_end', end)
         
-        chars = list(text)
+        # Keep punctuation attached to the previous character to prevent deletion
+        chars = []
+        for char in text:
+            if char in '.,!?。，！？、' and chars:
+                chars[-1] += char
+            elif char.strip():
+                chars.append(char)
         words = []
-        if chars:
-            duration_per_char = (end - start) / len(chars)
+        if text == "[SILENCE]":
+            words.append({
+                "word": "[SILENCE]",
+                "start": orig_start,
+                "end": orig_end,
+                "probability": 1.0
+            })
+        elif chars:
+            duration_per_char = (orig_end - orig_start) / len(chars) if len(chars) > 0 else 0
             for i, char in enumerate(chars):
-                w_start = start + i * duration_per_char
+                w_start = orig_start + i * duration_per_char
                 w_end = w_start + duration_per_char
                 words.append({
                     "word": char,
@@ -128,10 +218,13 @@ def _process_srt_to_json(srt_path, lang):
         segments.append({
             "start": start,
             "end": end,
+            "orig_start": orig_start,
+            "orig_end": orig_end,
             "text": text,
             "words": words
         })
     return {"segments": segments, "language": lang}
+
 
 class AudioEngine:
     def __init__(self, os_doctor, resolve_handler):
@@ -140,7 +233,7 @@ class AudioEngine:
         self.ffmpeg_cmd = self.os_doc.get_ffmpeg_cmd() or "ffmpeg"
         
         # Determine path to local libs for subprocess injection
-        self.libs_dir = os.path.join(os.path.dirname(__file__), "libs")
+        self.libs_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "libs")
         
         # Define local models directory (in install folder)
         self.models_dir = os.path.join(self.os_doc.install_dir, "models")
@@ -468,7 +561,8 @@ except Exception as e:
 
     def run_whisper(self, audio_path, model, lang, verbatim, device_mode, compute_type,
                     filler_words_list=None, initial_prompt=None, progress_callback=None,
-                    islands=None, status_callback=None):
+                    islands=None, status_callback=None, script_content=None, align_progress_callback=None,
+                    time_scale_correction=1.0):
         """
         Modified v11.0: Uses stable-ts (stable_whisper) with faster-whisper backend.
         FIXED v11.2: Injects portable bin path to OS PATH for sub-dependencies.
@@ -502,6 +596,12 @@ except Exception as e:
             if filler_words_list:
                 initial_prompt_str += f" {', '.join(filler_words_list)}"
 
+        ai_use_whisperjav = prefs.get('ai_use_whisperjav_for_zh', True)
+        is_wj = ai_use_whisperjav and lang and str(lang).lower().strip() in ("zh", "yue", "zh-tw", "zh-cn", "ja", "japanese")
+        
+        if not is_wj and script_content:
+            initial_prompt_str = (initial_prompt_str + " " + script_content)[:1000]
+
         env = os.environ.copy()
         env["HF_HOME"] = self.models_dir
         if hasattr(self, 'ffmpeg_cmd') and self.ffmpeg_cmd:
@@ -509,22 +609,26 @@ except Exception as e:
             if ffmpeg_dir:
                 env["PATH"] = f"{ffmpeg_dir}{os.pathsep}{env.get('PATH', '')}"
         
-        # ── Whisperjav Interception for Chinese ─────────────────────────────
+        # ── Whisperjav Interception ─────────────────────────────
         ai_use_whisperjav = prefs.get('ai_use_whisperjav_for_zh', True)
-        if ai_use_whisperjav and lang and str(lang).lower().strip() in ("zh", "yue", "zh-tw", "zh-cn"):
+        if ai_use_whisperjav and lang and str(lang).lower().strip() in ("zh", "yue", "zh-tw", "zh-cn", "ja", "japanese"):
             wj_path = os.path.expanduser(prefs.get('ai_whisperjav_path', config.DEFAULT_SETTINGS.get('ai_whisperjav_path', '~/venvs/whisperjav/bin/whisperjav')))
             if os.path.exists(wj_path):
                 log_info(f"[Whisperjav] Intercepting transcription for language {lang}. Executing: {wj_path}")
                 wj_args_str = prefs.get('ai_whisperjav_args', config.DEFAULT_SETTINGS.get('ai_whisperjav_args', ''))
                 wj_args = shlex.split(wj_args_str)
                 
-                cmd = [wj_path, audio_path] + wj_args + ["--output-format", "srt", "--output-dir", output_dir]
+                wj_temp_dir = os.path.join(output_dir, "wj_temp")
+                cmd = [wj_path, audio_path] + wj_args + ["--output-format", "srt", "--output-dir", output_dir, "--temp-dir", wj_temp_dir]
                 
-                if initial_prompt:
+                if initial_prompt_str:
+                    cmd += ["--initial-prompt", initial_prompt_str]
+                
+                if script_content:
                     context_path = os.path.join(output_dir, unique_name + "_context.txt")
                     try:
                         with open(context_path, 'w', encoding='utf-8') as f:
-                            f.write(initial_prompt)
+                            f.write(script_content)
                         cmd += ["--qwen-context-file", context_path]
                         log_info(f"[Whisperjav] Attached script context file: {context_path}")
                     except Exception as e:
@@ -541,17 +645,14 @@ except Exception as e:
                 # (saving gigabytes of duplicated models in BadWords' internal cache)
                 wj_env = env.copy()
                 wj_env.pop("HF_HOME", None)
+                wj_env["QWEN_INT8_QUANTIZE"] = "1"
                 
                 total_scenes = 1
                 
                 # Tracking state for decoupled chunks
-                wj_global_total = 0
-                wj_completed_gen = 0
-                wj_last_curr_gen = 0
-                wj_last_tot_gen = 0
-                wj_completed_align = 0
-                wj_last_curr_align = 0
-                wj_last_tot_align = 0
+                wj_total_portions = 1
+                wj_current_portion = 1
+                wj_phase = "gen"
                 
                 try:
                     process = subprocess.Popen(
@@ -580,59 +681,50 @@ except Exception as e:
                                         pass
                                 
                                 # Try to catch DecoupledPipeline progress
-                                m_scenes = re.search(r'Processing (\d+) scenes', line_str)
-                                if m_scenes:
-                                    try:
-                                        total_scenes = max(1, int(m_scenes.group(1)))
-                                    except: pass
-                                
-                                m_global = re.search(r'Phase 2: Detected (\d+) scenes', line_str)
-                                if m_global:
-                                    try: wj_global_total = int(m_global.group(1))
-                                    except: pass
+                                m_dec_gen = re.search(r'\[DecoupledPipeline\] Generating scene (\d+)/(\d+)', line_str)
+                                if m_dec_gen:
+                                    wj_phase = "gen"
+                                    wj_current_portion = int(m_dec_gen.group(1))
+                                    wj_total_portions = int(m_dec_gen.group(2))
+
+                                m_dec_align = re.search(r'\[DecoupledPipeline\] Aligning scene (\d+)/(\d+)', line_str)
+                                if m_dec_align:
+                                    wj_phase = "align"
+                                    wj_current_portion = int(m_dec_align.group(1))
+                                    wj_total_portions = int(m_dec_align.group(2))
 
                                 m_gen = re.search(r'ASR Text Gen \| Scene (\d+)/(\d+)', line_str)
                                 if m_gen:
+                                    wj_phase = "gen"
                                     if status_callback:
                                         try: status_callback("Transcribing...")
                                         except: pass
                                     try:
                                         curr = int(m_gen.group(1))
                                         tot = int(m_gen.group(2))
-                                        if curr < wj_last_curr_gen:
-                                            wj_completed_gen += wj_last_tot_gen
-                                        wj_last_curr_gen = curr
-                                        wj_last_tot_gen = tot
-                                        
-                                        if wj_global_total > 0:
-                                            pct = int(((wj_completed_gen + curr) / wj_global_total) * 50)
-                                        else:
-                                            pct = int((curr / tot) * 50)
-                                        
-                                        pct = min(50, max(0, pct))
+                                        portion_base = (wj_current_portion - 1) / max(1, wj_total_portions)
+                                        sub_prog = (curr / max(1, tot)) * (1.0 / max(1, wj_total_portions))
+                                        pct = int((portion_base + sub_prog) * 100)
+                                        pct = min(100, max(0, pct))
                                         progress_callback(pct)
                                     except: pass
 
                                 m_align = re.search(r'Aligning \| Scen\w*\s+(\d+)/(\d+)', line_str)
                                 if m_align:
+                                    if wj_phase != "align":
+                                        wj_phase = "align"
                                     if status_callback:
                                         try: status_callback("Aligning...")
                                         except: pass
                                     try:
                                         curr = int(m_align.group(1))
                                         tot = int(m_align.group(2))
-                                        if curr < wj_last_curr_align:
-                                            wj_completed_align += wj_last_tot_align
-                                        wj_last_curr_align = curr
-                                        wj_last_tot_align = tot
-
-                                        if wj_global_total > 0:
-                                            pct = 50 + int(((wj_completed_align + curr) / wj_global_total) * 49)
-                                        else:
-                                            pct = 50 + int((curr / tot) * 49)
-                                        
-                                        pct = min(100, max(50, pct))
-                                        progress_callback(pct)
+                                        portion_base = (wj_current_portion - 1) / max(1, wj_total_portions)
+                                        sub_prog = (curr / max(1, tot)) * (1.0 / max(1, wj_total_portions))
+                                        pct = int((portion_base + sub_prog) * 100)
+                                        pct = min(100, max(0, pct))
+                                        if align_progress_callback:
+                                            align_progress_callback(pct)
                                     except: pass
 
                 except Exception as e:
@@ -665,7 +757,8 @@ except Exception as e:
                 except Exception as e:
                     log_error(f"Failed to load generated SRT into engine memory: {e}")
 
-                json_data = _process_srt_to_json(srt_file, lang)
+                json_data = _process_srt_to_json(srt_file, lang, time_scale=time_scale_correction)
+                json_data["is_whisperjav"] = True
                 with open(json_output_path, 'w', encoding='utf-8') as f:
                     json.dump(json_data, f, ensure_ascii=False, indent=2)
                 
@@ -1279,7 +1372,7 @@ except Exception as e:
     # 3. MAIN ANALYSIS PIPELINE
     # ==========================================
 
-    def run_fast_silence_pipeline(self, settings, callback_status=None, callback_progress=None):
+    def run_fast_silence_pipeline(self, settings, callback_status=None, callback_progress=None, callback_align_progress=None):
         """
         Fast Silence Cut: render audio, run FFmpeg silencedetect, build a minimal
         words_data list of 'silence' segments — no Whisper involved.
@@ -1471,7 +1564,7 @@ except Exception as e:
                     log_error(f"run_fast_silence_pipeline cleanup: cannot remove wav: {e}")
 
 
-    def run_analysis_pipeline(self, settings, callback_status=None, callback_progress=None):
+    def run_analysis_pipeline(self, settings, callback_status=None, callback_progress=None, callback_align_progress=None):
         def update_status(msg):
             if callback_status: callback_status(msg)
         def update_progress(val):
@@ -1502,7 +1595,8 @@ except Exception as e:
             # Stage 6A: Prefer user-saved ai_compute_type from settings; auto-detect as fallback
             saved_prefs     = self.os_doc.get_all_prefs()
             saved_compute        = saved_prefs.get('ai_compute_type', '')
-            user_custom_prompt   = settings.get('ai_initial_prompt_override', '') or saved_prefs.get('ai_initial_prompt', '').strip()
+            user_custom_prompt   = saved_prefs.get('ai_initial_prompt', '').strip()
+            script_content       = settings.get('script_content', '').strip()
             # Per-language prompt selection: respects custom user prompt first,
             # then falls back to a language-specific verbatim prompt, then GOLDEN baseline.
             # lang is resolved above (None = auto-detect, str = specific language code)
@@ -1556,6 +1650,11 @@ except Exception as e:
                     settings.get('timeline_name') or self.resolve_handler.timeline.GetName(),
                     track_indices_for_render
                 )
+                if _end_s is None:
+                    err_msg = "The selected audio track has no clips. Please select 'All Tracks' or the correct track in the GUI."
+                    log_error(err_msg)
+                    return None, err_msg
+                
                 if _end_s:
                     _fps = self.resolve_handler.fps or 60.0
                     end_frame_override_tx = int(round(_end_s * _fps))
@@ -1678,9 +1777,12 @@ except Exception as e:
                 target_wav, model, lang, True, device_mode, fw_compute,
                 filler_words,
                 initial_prompt=ai_initial_prompt,
+                script_content=script_content,
                 progress_callback=whisper_live_progress,
                 islands=islands,
-                status_callback=update_status
+                status_callback=update_status,
+                align_progress_callback=callback_align_progress,
+                time_scale_correction=time_scale_correction
             )
             
             if not json_path:
@@ -1692,10 +1794,10 @@ except Exception as e:
             # Cleanup
             for p in [wav_path, current_wav_path, normalized_wav]:
                 if p and os.path.exists(p) and p != wav_path:
-                    try: os.remove(p)
+                    try: pass # os.remove(p)
                     except Exception as e:
                         log_error(f"run_analysis_pipeline cleanup: cannot remove {p}: {e}")
-            try: os.remove(wav_path)
+            try: pass # os.remove(wav_path)
             except Exception as e:
                 log_error(f"run_analysis_pipeline cleanup: cannot remove wav: {e}")
 
@@ -1751,105 +1853,116 @@ except Exception as e:
         def clean_word(txt): return re.sub(r'[^\w\s\'-]', '', txt.strip()).lower()
         def clean_for_match(txt): return re.sub(r'[^\w\s\'-]', '', txt.strip()).lower()
 
-        # --- PASS 1: N-GRAM HALLUCINATION COMPRESSOR ---
-        # Detects and compresses perfectly repeating consecutive phrases (from 1 to 15 words)
-        # into a single tile e.g. "I went to the store [x30]"
-        all_raw_words = []
-        for seg in json_data.get('segments', []):
-            for w in seg.get('words', []):
-                all_raw_words.append(w)
+        is_wj = json_data.get("is_whisperjav", False)
 
-        if all_raw_words:
-            # FIX OP-01: Zmniejszenie n-gram z 15 do 5 drastycznie redukuje złożoność
-            for n in range(1, 6):
-                i = 0
-                while i <= len(all_raw_words) - n * 2:
-                    ngram = [clean_for_match(w['word']) for w in all_raw_words[i:i+n]]
-                    if not any(ngram): 
-                        i += 1
-                        continue
-                    
-                    repeats = 1
-                    curr_idx = i + n
-                    while curr_idx <= len(all_raw_words) - n:
-                        next_ngram = [clean_for_match(w['word']) for w in all_raw_words[curr_idx:curr_idx+n]]
-                        if next_ngram == ngram:
-                            repeats += 1
-                            curr_idx += n
-                        else:
-                            break
+        if is_wj:
+            # Bypass Pass 1 and Pass 2 to exactly preserve Qwen's subtitle boundaries
+            chunks = []
+            for seg in json_data.get('segments', []):
+                chunk = seg.get('words', [])
+                if chunk:
+                    chunks.append(chunk)
+            compressed_words = [w for chunk in chunks for w in chunk]
+        else:
+            # --- PASS 1: N-GRAM HALLUCINATION COMPRESSOR ---
+            # Detects and compresses perfectly repeating consecutive phrases (from 1 to 15 words)
+            # into a single tile e.g. "I went to the store [x30]"
+            all_raw_words = []
+            for seg in json_data.get('segments', []):
+                for w in seg.get('words', []):
+                    all_raw_words.append(w)
+    
+            if all_raw_words:
+                # FIX OP-01: Zmniejszenie n-gram z 15 do 5 drastycznie redukuje złożoność
+                for n in range(1, 6):
+                    i = 0
+                    while i <= len(all_raw_words) - n * 2:
+                        ngram = [clean_for_match(w['word']) for w in all_raw_words[i:i+n]]
+                        if not any(ngram): 
+                            i += 1
+                            continue
+                        
+                        repeats = 1
+                        curr_idx = i + n
+                        while curr_idx <= len(all_raw_words) - n:
+                            next_ngram = [clean_for_match(w['word']) for w in all_raw_words[curr_idx:curr_idx+n]]
+                            if next_ngram == ngram:
+                                repeats += 1
+                                curr_idx += n
+                            else:
+                                break
+                                
+                        threshold = 4 if n > 1 else 5
+                        if repeats >= threshold:
+                            merged_word_text = " ".join(w['word'].strip() for w in all_raw_words[i : i+n])
                             
-                    threshold = 4 if n > 1 else 5
-                    if repeats >= threshold:
-                        merged_word_text = " ".join(w['word'].strip() for w in all_raw_words[i : i+n])
+                            merged = all_raw_words[i].copy()
+                            merged['word'] = f"{merged_word_text} [x{repeats}]"
+                            merged['end'] = all_raw_words[curr_idx - 1]['end']
+                            merged['_is_hallucination'] = True
+                            
+                            # Replace the entire repeating sequence with the single compressed dictionary
+                            all_raw_words[i : curr_idx] = [merged]
                         
-                        merged = all_raw_words[i].copy()
-                        merged['word'] = f"{merged_word_text} [x{repeats}]"
-                        merged['end'] = all_raw_words[curr_idx - 1]['end']
-                        merged['_is_hallucination'] = True
-                        
-                        # Replace the entire repeating sequence with the single compressed dictionary
-                        all_raw_words[i : curr_idx] = [merged]
-                    
-                    i += 1
-
-        compressed_words = all_raw_words
-
-        # --- PASS 2: SMART CHUNKING (Z LOOKAHEAD) ---
-        c_max = int(prefs.get('chunk_max_words', 30))
-        c_look = int(prefs.get('chunk_lookahead', 3))
-        # GOLDEN fix: use chunk_min_words (word count) not chunk_min_chars (char count)
-        c_min = int(prefs.get('chunk_min_words', prefs.get('chunk_min_chars', 7)))
-        c_punct_target = int(prefs.get('chunk_punct_count', 1))
-        c_hard_limit = c_max + c_look
-
-        chunks = []
-        curr_chunk = []
-        punct_seen = 0
-        for i, w in enumerate(compressed_words):
-            curr_chunk.append(w)
-            
-            last_word_text = w['word'].strip()
-            has_punct = last_word_text.endswith(('.', '?', '!'))
-            if has_punct:
-                punct_seen += 1
-            should_break = False
-            
-            # Absolute maximum hard limit to prevent infinite run-ons
-            if len(curr_chunk) >= c_hard_limit:
-                should_break = True
-            elif len(curr_chunk) >= c_max:
-                # GOLDEN fix: break if the CURRENT word has punctuation (not accumulated count).
-                # In src_old: `if has_punct: should_break = True` — per-word check.
+                        i += 1
+    
+            compressed_words = all_raw_words
+    
+            # --- PASS 2: SMART CHUNKING (Z LOOKAHEAD) ---
+            c_max = int(prefs.get('chunk_max_words', 30))
+            c_look = int(prefs.get('chunk_lookahead', 3))
+            # GOLDEN fix: use chunk_min_words (word count) not chunk_min_chars (char count)
+            c_min = int(prefs.get('chunk_min_words', prefs.get('chunk_min_chars', 7)))
+            c_punct_target = int(prefs.get('chunk_punct_count', 1))
+            c_hard_limit = c_max + c_look
+    
+            chunks = []
+            curr_chunk = []
+            punct_seen = 0
+            for i, w in enumerate(compressed_words):
+                curr_chunk.append(w)
+                
+                last_word_text = w['word'].strip()
+                has_punct = last_word_text.endswith(('.', '?', '!', '。', '？', '！', '，', '、'))
                 if has_punct:
-                    should_break = True  # Break immediately if current word has punctuation
-                else:
-                    # Look ahead up to remaining allowance (c_hard_limit - current_length)
-                    allowance = c_hard_limit - len(curr_chunk)
-                    lookahead_limit = min(allowance, len(compressed_words) - i - 1)
-                    found_punct = False
-                    
-                    for j in range(1, lookahead_limit + 1):
-                        next_w_text = compressed_words[i + j]['word'].strip()
-                        if next_w_text.endswith(('.', '?', '!')):
-                            found_punct = True
-                            break
-                    
-                    # If we didn't find any punctuation in the upcoming allowed words, break now.
-                    # If we DID find it, we keep going (should_break = False) until we hit it in next loops.
-                    if not found_punct:
-                        should_break = True
-            # GOLDEN fix: normal soft break — require current word has punct (has_punct), not cumulative count.
-            elif len(curr_chunk) >= c_min and has_punct:
-                should_break = True  # Normal soft break mid-sentence
+                    punct_seen += 1
+                should_break = False
                 
-            if should_break:
+                # Absolute maximum hard limit to prevent infinite run-ons
+                if len(curr_chunk) >= c_hard_limit:
+                    should_break = True
+                elif len(curr_chunk) >= c_max:
+                    # GOLDEN fix: break if the CURRENT word has punctuation (not accumulated count).
+                    # In src_old: `if has_punct: should_break = True` — per-word check.
+                    if has_punct:
+                        should_break = True  # Break immediately if current word has punctuation
+                    else:
+                        # Look ahead up to remaining allowance (c_hard_limit - current_length)
+                        allowance = c_hard_limit - len(curr_chunk)
+                        lookahead_limit = min(allowance, len(compressed_words) - i - 1)
+                        found_punct = False
+                        
+                        for j in range(1, lookahead_limit + 1):
+                            next_w_text = compressed_words[i + j]['word'].strip()
+                            if next_w_text.endswith(('.', '?', '!', '。', '？', '！', '，', '、')):
+                                found_punct = True
+                                break
+                        
+                        # If we didn't find any punctuation in the upcoming allowed words, break now.
+                        # If we DID find it, we keep going (should_break = False) until we hit it in next loops.
+                        if not found_punct:
+                            should_break = True
+                # GOLDEN fix: normal soft break — require current word has punct (has_punct), not cumulative count.
+                elif len(curr_chunk) >= c_min and has_punct:
+                    should_break = True  # Normal soft break mid-sentence
+                    
+                if should_break:
+                    chunks.append(curr_chunk)
+                    curr_chunk = []
+                    punct_seen = 0
+                    
+            if curr_chunk:
                 chunks.append(curr_chunk)
-                curr_chunk = []
-                punct_seen = 0
-                
-        if curr_chunk:
-            chunks.append(curr_chunk)
 
         # --- PASS 3: RAW DATA & FILLER WORDS ONLY ---
         for chunk in chunks:
@@ -1932,7 +2045,8 @@ except Exception as e:
         # --- SILENCE PRECEDENCE LOGIC ---
         # If words are smeared across silences (e.g. from whisperjav),
         # we strictly carve out the words so the perfect silences can breathe.
-        if silence_ranges and temp_words:
+        is_whisperjav = json_data.get('is_whisperjav', False)
+        if silence_ranges and temp_words and not is_whisperjav:
             for w in temp_words:
                 for s in silence_ranges:
                     if s['s'] < w['end'] and s['e'] > w['start']:
@@ -2109,7 +2223,6 @@ except Exception as e:
         
         processed_words = []
         for w in words_data:
-            if w.get('type') == 'silence': continue
             is_inaudible = w.get('is_inaudible') or w.get('type') == 'inaudible'
             
             # W pełni ignorujemy fragment inaudible podczas składania osi czasu,
@@ -2180,12 +2293,21 @@ except Exception as e:
                 else:
                     block_end_f = raw_block_end
 
+            word_e = min(block_end_f, t2f(chunk_end_w))
             
             ops_raw.append({
                 's': block_start_f,
-                'e': block_end_f,
+                'e': word_e,
                 'type': chunk['status']
             })
+            
+            if word_e < block_end_f:
+                ops_raw.append({
+                    's': word_e,
+                    'e': block_end_f,
+                    'type': 'gap'
+                })
+                
             current_time_f = block_end_f
 
         if do_silence_cut or do_silence_mark:
@@ -2217,14 +2339,23 @@ except Exception as e:
                         elif s_s <= sub['s'] and s_e >= sub['e']:
                             if do_silence_mark:
                                 new_sub.append({'s': sub['s'], 'e': sub['e'], 'type': 'silence_mark'})
+                            elif do_silence_cut:
+                                pass # drop it
+                            else:
+                                new_sub.append(sub)
                         else:
                             if s_s > sub['s']:
                                 new_sub.append({'s': sub['s'], 'e': s_s, 'type': sub['type']})
                             
+                            overlap_s = max(sub['s'], s_s)
+                            overlap_e = min(sub['e'], s_e)
+                            
                             if do_silence_mark:
-                                overlap_s = max(sub['s'], s_s)
-                                overlap_e = min(sub['e'], s_e)
                                 new_sub.append({'s': overlap_s, 'e': overlap_e, 'type': 'silence_mark'})
+                            elif do_silence_cut:
+                                pass # drop it
+                            else:
+                                new_sub.append({'s': overlap_s, 'e': overlap_e, 'type': sub['type']})
                             
                             if s_e < sub['e']:
                                 new_sub.append({'s': s_e, 'e': sub['e'], 'type': sub['type']})
@@ -2233,17 +2364,23 @@ except Exception as e:
                 final_ops.extend(sub_segments)
             ops_raw = final_ops
 
+
         ops_raw.sort(key=lambda x: x['s'])
         
         merged_ops = []
         if ops_raw:
-            curr = ops_raw[0]
+            curr = ops_raw[0].copy()
+            if curr['type'] == 'gap': curr['type'] = 'normal'
+            
             for next_op in ops_raw[1:]:
-                if next_op['type'] == curr['type'] and next_op['s'] <= curr['e'] + 1:
-                    curr['e'] = max(curr['e'], next_op['e'])
+                next_copy = next_op.copy()
+                if next_copy['type'] == 'gap': next_copy['type'] = 'normal'
+                
+                if next_copy['type'] == curr['type'] and next_copy['s'] <= curr['e'] + 1:
+                    curr['e'] = max(curr['e'], next_copy['e'])
                 else:
                     merged_ops.append(curr)
-                    curr = next_op
+                    curr = next_copy
             merged_ops.append(curr)
             
         final_result = []
@@ -2252,6 +2389,10 @@ except Exception as e:
             if op['e'] - op['s'] < 2: continue 
             final_result.append(op)
             
+        counts2 = {}
+        for op in final_result: counts2[op['type']] = counts2.get(op['type'], 0) + 1
+        log_info(f"DEBUG: Ops after merge/filter: total={len(final_result)}, counts={counts2}")
+
         return final_result
 
     # ==========================================
@@ -2283,6 +2424,19 @@ except Exception as e:
 
             with open(file_path, 'w', encoding='utf-8') as f:
                 json.dump(project_state, f, separators=(',', ':'))
+
+            # Also save the raw Whisperjav SRT alongside the JSON so exact
+            # sentence-level timestamps are preserved for post-assembly SRT generation.
+            srt_content = getattr(self, 'current_srt_content', None)
+            if srt_content:
+                srt_path = file_path.rsplit('.', 1)[0] + ".srt"
+                try:
+                    with open(srt_path, 'w', encoding='utf-8') as f:
+                        f.write(srt_content)
+                    log_info(f"save_project_state: saved raw SRT → {srt_path}")
+                except Exception as srt_err:
+                    log_error(f"save_project_state: failed to save SRT: {srt_err}")
+
             return True
         except Exception as e:
             log_error(f"Save Project Error: {e}")
@@ -2452,7 +2606,7 @@ except Exception as e:
 
             # ── NAME FOR NEW TIMELINE ─────────────────────────────────────────
             clean_name, next_idx = self.resolve_handler.get_next_badwords_edit_index(original_tl_name)
-            new_tl_name = f"{clean_name} BadWords Edit {next_idx}"
+            new_tl_name = f"BW [{next_idx}] {clean_name}"
 
             # ── LOAD PRESERVE TRACK ORDER + AUTO_DEL SETTINGS ────────────────
             import config
@@ -2587,6 +2741,93 @@ except Exception as e:
 
                                 if srt_path and exists:
                                     try:
+                                        log_info(f"assemble_timeline: Adjusting SRT timestamps to match cut timeline...")
+                                        adjusted_srt_path = os.path.join(self.os_doc.get_temp_folder(), "adjusted_" + os.path.basename(srt_path))
+                                        
+                                        import re
+                                        from datetime import timedelta
+                                        
+                                        def parse_srt_time(time_str):
+                                            parts = re.split(r'[:,.]', time_str.strip())
+                                            try:
+                                                if len(parts) >= 4:
+                                                    return timedelta(hours=int(parts[0]), minutes=int(parts[1]), seconds=int(parts[2]), milliseconds=int(parts[3])).total_seconds()
+                                                elif len(parts) == 3:
+                                                    return timedelta(minutes=int(parts[0]), seconds=int(parts[1]), milliseconds=int(parts[2])).total_seconds()
+                                            except:
+                                                pass
+                                            return 0.0
+
+                                        def fmt_time(sec):
+                                            h = int(sec // 3600)
+                                            m = int((sec % 3600) // 60)
+                                            s = int(sec % 60)
+                                            ms = int(round((sec - int(sec)) * 1000))
+                                            return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+                                            
+                                        tl_start_frame = 0
+                                        if hasattr(new_tl, 'GetStartFrame'):
+                                            tl_start_frame = int(new_tl.GetStartFrame())
+                                            log_info(f"assemble_timeline: Shifting SRT timecode by timeline start frame: {tl_start_frame}")
+
+                                        def map_time_to_cut(time_s):
+                                            time_f = int(round(time_s * fps))
+                                            dest_f = 0
+                                            for op in clean_ops:
+                                                if time_f >= op['e']:
+                                                    dest_f += (op['e'] - op['s'])
+                                                elif time_f >= op['s']:
+                                                    dest_f += (time_f - op['s'])
+                                                    return (dest_f + tl_start_frame) / fps
+                                                else:
+                                                    return (dest_f + tl_start_frame) / fps
+                                            return (dest_f + tl_start_frame) / fps
+
+                                        with open(srt_path, 'r', encoding='utf-8') as f:
+                                            content = f.read()
+                                            
+                                        blocks = re.split(r'\r?\n\r?\n', content.strip())
+                                        new_blocks = []
+                                        
+                                        for block in blocks:
+                                            lines = [line.strip() for line in block.split('\n') if line.strip()]
+                                            if len(lines) >= 2:
+                                                time_line = None
+                                                text_start_idx = 0
+                                                for i, line in enumerate(lines):
+                                                    if '-->' in line:
+                                                        time_line = line
+                                                        text_start_idx = i + 1
+                                                        break
+                                                if time_line:
+                                                    start_str, end_str = time_line.split('-->')
+                                                    start_sec = parse_srt_time(start_str.strip())
+                                                    end_sec = parse_srt_time(end_str.strip())
+                                                    
+                                                    new_start = map_time_to_cut(start_sec)
+                                                    new_end = map_time_to_cut(end_sec)
+                                                    
+                                                    if new_end - new_start > 0.05:
+                                                        text = '\n'.join(lines[text_start_idx:])
+                                                        new_blocks.append({
+                                                            'start': new_start,
+                                                            'end': new_end,
+                                                            'text': text
+                                                        })
+                                                        
+                                        with open(adjusted_srt_path, 'w', encoding='utf-8') as f:
+                                            for i, b in enumerate(new_blocks):
+                                                f.write(f"{i+1}\n")
+                                                f.write(f"{fmt_time(b['start'])} --> {fmt_time(b['end'])}\n")
+                                                f.write(b['text'] + "\n\n")
+                                                
+                                        srt_path = adjusted_srt_path
+                                        log_info(f"assemble_timeline: Adjusted SRT saved to {srt_path}")
+                                    except Exception as e:
+                                        log_error(f"assemble_timeline: Failed to adjust SRT timestamps: {e}")
+
+                                if srt_path and exists:
+                                    try:
                                         self.resolve_handler.project.SetCurrentTimeline(new_tl)
                                         success = new_tl.ImportIntoTimeline(srt_path)
                                         if success:
@@ -2609,16 +2850,17 @@ except Exception as e:
                                     except Exception as e:
                                         log_error(f"assemble_timeline: Exception injecting SRT: {e}")
 
-                            # Move timeline directly into BadWords/ root bin (no Edits subfolder).
-                            bw_bin = self.resolve_handler.get_badwords_root_bin()
-                            if bw_bin:
+
+                            # Move assembled timeline into Master (root) bin.
+                            root_bin = self.resolve_handler.media_pool.GetRootFolder()
+                            if root_bin:
                                 try:
                                     tl_item = self.resolve_handler.find_timeline_item_recursive(
                                         self.resolve_handler.media_pool.GetRootFolder(), actual_name
                                     )
                                     if tl_item:
-                                        self.resolve_handler.media_pool.MoveClips([tl_item], bw_bin)
-                                        log_info(f"assemble_timeline: moved '{actual_name}' → BadWords/")
+                                        self.resolve_handler.media_pool.MoveClips([tl_item], root_bin)
+                                        log_info(f"assemble_timeline: moved '{actual_name}' → Master")
                                     else:
                                         log_error("assemble_timeline: timeline item not found in pool")
                                 except Exception as move_err:
@@ -2690,7 +2932,7 @@ except Exception as e:
 
                 # Re-compute edit name (may have been taken if XML partially worked)
                 fb_name, fb_idx = self.resolve_handler.get_next_badwords_edit_index(original_tl_name)
-                fb_tl_name = f"{fb_name} BadWords Edit {fb_idx}"
+                fb_tl_name = f"BW [{fb_idx}] {fb_name}"
 
                 def fb_progress(current, total):
                     set_progress(int((current / max(1, total)) * 100))
@@ -2720,6 +2962,39 @@ except Exception as e:
             gc.collect()
 
             set_progress(100)
+            # ── Auto-copy SRT to project folder ────────────────────────────────
+            try:
+                final_srt = None
+                if hasattr(self, 'current_srt_name') and self.current_srt_name:
+                    final_srt = os.path.join(self.os_doc.get_temp_folder(), self.current_srt_name)
+                
+                if final_srt and os.path.exists(final_srt):
+                    proj_name = self.resolve_handler.project.GetName()
+                    proj_folder = None
+                    import re, shutil
+                    workspace_path = "/Users/akash/Desktop/videos"
+                    for name in [proj_name, original_tl_name]:
+                        match = re.search(r'^(\d+)', name)
+                        if match:
+                            num_str = match.group(1)
+                            try:
+                                for item in os.listdir(workspace_path):
+                                    if os.path.isdir(os.path.join(workspace_path, item)):
+                                        if item.startswith(f"{num_str} -") or item.startswith(f"{num_str} ") or item.startswith(f"{num_str}_") or item == num_str:
+                                            proj_folder = os.path.join(workspace_path, item)
+                                            break
+                            except Exception:
+                                pass
+                        if proj_folder: break
+                        
+                    if proj_folder:
+                        dest_srt_custom = os.path.join(proj_folder, "subtitles", "badwords_raw.txt")
+                        os.makedirs(os.path.dirname(dest_srt_custom), exist_ok=True)
+                        shutil.copy(final_srt, dest_srt_custom)
+                        log_info(f"assemble_timeline: Copied final SRT to {dest_srt_custom}")
+            except Exception as e:
+                log_error(f"assemble_timeline: Failed to copy final SRT to project folder: {e}")
+
             return True, warning_code, new_tl_name, clean_ops
 
         except Exception as e:

@@ -89,7 +89,7 @@ class OSDoctor:
         
         # --- SELF-CONTAINED PATH LOGIC ---
         # Instead of using system APPDATA, we use the directory where this script resides.
-        self.install_dir = os.path.dirname(os.path.abspath(__file__))
+        self.install_dir = os.path.dirname(os.path.realpath(__file__))
         
         # Force AppData to be the Install Dir
         self.app_data_dir = self.install_dir
@@ -518,10 +518,16 @@ class OSDoctor:
         
         # 2. Check Local User Bin (Legacy)
         if self.is_linux or self.is_mac:
-            local_bin = os.path.expanduser("~/.local/bin/ffmpeg")
-            if os.path.exists(local_bin) and self._test_executable(local_bin): 
-                log_info(f"[FFMPEG] Using Legacy Local Binary: {local_bin}")
-                return local_bin
+            mac_paths = [
+                os.path.expanduser("~/.local/bin/ffmpeg"),
+                "/opt/homebrew/bin/ffmpeg",
+                "/usr/local/bin/ffmpeg"
+            ] if self.is_mac else [os.path.expanduser("~/.local/bin/ffmpeg")]
+            
+            for local_bin in mac_paths:
+                if os.path.exists(local_bin) and self._test_executable(local_bin): 
+                    log_info(f"[FFMPEG] Using Legacy/System Binary fallback: {local_bin}")
+                    return local_bin
             
         # 3. System PATH fallback
         sys_ffmpeg = shutil.which("ffmpeg")

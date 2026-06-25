@@ -406,7 +406,7 @@ class ResolveHandler:
                 return []
 
             a_count = target_tl.GetTrackCount("audio")
-            populated = []
+            populated = {}
             
             # Resolve's SWIG objects might return None for unknown methods
             _get_name_fn = getattr(target_tl, "GetTrackName", None)
@@ -427,7 +427,12 @@ class ResolveHandler:
                         if not track_name:
                             track_name = f"Audio {i}"
                             
-                        populated.append(track_name)
+                        # If multiple tracks have the same name, Resolve UI gets confusing,
+                        # but we still map it to the latest index found or append a suffix
+                        while track_name in populated:
+                            track_name += f" ({i})"
+                            
+                        populated[track_name] = i
                 except Exception:
                     # If the call fails, skip this track safely
                     pass
@@ -435,7 +440,7 @@ class ResolveHandler:
 
         except Exception as e:
             log_error(f"get_audio_tracks error: {e}")
-            return []
+            return {}
 
 
     def get_next_badwords_edit_index(self, original_name):
@@ -1911,6 +1916,9 @@ class ResolveHandler:
             corrected = 0
             ok_count  = 0
             missed    = 0
+            color_set_counts   = {}   # color → number of clips SET via API
+            color_ok_counts    = {}   # color → number of clips already correct from XML
+            color_failed_counts = {}  # color → SetClipColor returned unexpected result
 
             def verify_track(track_type, track_count):
                 nonlocal corrected, ok_count, missed
@@ -1950,8 +1958,20 @@ class ResolveHandler:
                                 actual_color = ""
                             if actual_color.lower() == expected_color.lower():
                                 ok_count += 1  # XML set it correctly
+                                color_ok_counts[expected_color] = color_ok_counts.get(expected_color, 0) + 1
                             else:
-                                item.SetClipColor(expected_color)
+                                try:
+                                    item.SetClipColor(expected_color)
+                                    # Verify it actually took
+                                    verify_color = item.GetClipColor() or ""
+                                    if verify_color.lower() == expected_color.lower():
+                                        color_set_counts[expected_color] = color_set_counts.get(expected_color, 0) + 1
+                                    else:
+                                        color_failed_counts[expected_color] = color_failed_counts.get(expected_color, 0) + 1
+                                        log_error(f"reapply_clip_colors: SetClipColor('{expected_color}') FAILED on {track_type}{ti} start={item_start} — got '{verify_color}' back")
+                                except Exception as ce:
+                                    log_error(f"reapply_clip_colors: SetClipColor exception on {track_type}{ti} start={item_start}: {ce}")
+                                    color_failed_counts[expected_color] = color_failed_counts.get(expected_color, 0) + 1
                                 corrected += 1
                     except Exception as te:
                         log_error(f"reapply_clip_colors verify {track_type}{ti}: {te}")
@@ -1961,9 +1981,15 @@ class ResolveHandler:
             verify_track("video", v_count)
             verify_track("audio", a_count)
 
+            all_colors = sorted(set(list(color_set_counts.keys()) + list(color_ok_counts.keys()) + list(color_failed_counts.keys())))
+            color_log = ", ".join(
+                f"{c}: {color_ok_counts.get(c,0)} ok + {color_set_counts.get(c,0)} set" +
+                (f" + {color_failed_counts.get(c,0)} FAILED" if color_failed_counts.get(c,0) else "")
+                for c in all_colors
+            )
             log_info(f"reapply_clip_colors: '{tl_name}' — "
-                     f"{ok_count} ok from XML, {corrected} corrected via API"
-                     + (f", {missed} unmatched (normal)" if missed else "."))
+                     f"{ok_count} normal-ok, {corrected} colored, {missed} unmatched | "
+                     + (color_log or "no colors set"))
 
         except Exception as e:
             log_error(f"reapply_clip_colors error: {e}")

@@ -788,7 +788,7 @@ class ToggleSwitch(QWidget):
 def _app_icon() -> QIcon:
     try:
         import json
-        install_dir = os.path.dirname(os.path.abspath(__file__))
+        install_dir = os.path.dirname(os.path.realpath(__file__))
         is_win = platform.system() == "Windows"
         ext = ".ico" if is_win else ".png"
 
@@ -1029,7 +1029,7 @@ class SearchOverlayWidget(QFrame):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         
-        _src_dir = os.path.dirname(os.path.abspath(__file__))
+        _src_dir = os.path.dirname(os.path.realpath(__file__))
         _icon_path = os.path.join(_src_dir, "layout", "search.png")
         
         self.btn_open_search = QPushButton()
@@ -1350,6 +1350,7 @@ class SearchOverlayWidget(QFrame):
 # FIX KR-03: Zastąpiono WorkerSignals bezpieczną klasą dziedziczącą po QThread
 class AnalysisWorker(QThread):
     progress = Signal(int)
+    align_progress = Signal(int)
     status = Signal(str)
     finished_ok = Signal(object, object)
     error = Signal(str)
@@ -1366,7 +1367,8 @@ class AnalysisWorker(QThread):
             words_data, segments_data = func(
                 self.settings,
                 callback_status=self.status.emit,
-                callback_progress=self.progress.emit
+                callback_progress=self.progress.emit,
+                callback_align_progress=self.align_progress.emit
             )
             self.finished_ok.emit(words_data, segments_data)
         except Exception as e:
@@ -2450,8 +2452,10 @@ class CustomTitleBar(QWidget):
         self.chapter_dropdown.hide() # Hidden until at least one assembly happens
         
         # Resolve icon directory (assets/layout/ sibling to src/)
-        _src_dir    = os.path.dirname(os.path.abspath(__file__))
-        _assets_dir = os.path.join(_src_dir, "layout")
+        _src_dir    = os.path.dirname(os.path.realpath(__file__))
+        _prod_assets_dir = os.path.join(_src_dir, "layout")
+        _dev_assets_dir = os.path.join(os.path.dirname(_src_dir), "assets", "layout")
+        _assets_dir = _prod_assets_dir if os.path.exists(_prod_assets_dir) else _dev_assets_dir
 
         self.btn_min = AnimatedTitleButton(
             os.path.join(_assets_dir, "minimize.png"),
@@ -2512,7 +2516,7 @@ class CustomTitleBar(QWidget):
 
     def update_maximize_icon(self, is_maximized):
         icon_name = 'windowed.png' if is_maximized else 'maximize.png'
-        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'layout', icon_name)
+        icon_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'layout', icon_name)
 
         # Używamy nowej metody, która zabezpiecza ikonę przed resetem przez animację hover!
         self.btn_max.change_base_icon(icon_path)
@@ -3599,7 +3603,7 @@ class SidebarButton(QPushButton):
         elif activity_id == "settings":
             image_name = "settings.png"
             
-        _src_dir = os.path.dirname(os.path.abspath(__file__))
+        _src_dir = os.path.dirname(os.path.realpath(__file__))
         _prod_assets_dir = os.path.join(_src_dir, "layout")
         _dev_assets_dir = os.path.join(os.path.dirname(_src_dir), "assets", "layout")
         _assets_dir = _prod_assets_dir if os.path.exists(_prod_assets_dir) else _dev_assets_dir
@@ -8903,9 +8907,9 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
             if title_text and title_text != "BadWords":
                 if hasattr(self, '_title_bar'):
                     self._title_bar.set_title(title_text)
-            elif self._transcription_source:
+            elif getattr(self, '_transcription_source', None):
                 # Rebuild title from snapshot
-                snap = self._transcription_source
+                snap = getattr(self, '_transcription_source', None)
                 tl_name = snap.get('timeline_name', '')
                 track_names = snap.get('track_names', [])
                 all_tl_tracks = snap.get('all_tracks', True)
@@ -9006,7 +9010,7 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
                 import copy
                 self._chapters = [{
                     "name": "Original",
-                    "tl_name": self._transcription_source.get("timeline_name", "") if self._transcription_source else "",
+                    "tl_name": getattr(self, '_transcription_source', {}).get("timeline_name", "") if getattr(self, '_transcription_source', None) else "",
                     "words": copy.deepcopy(state.get('words_data', []))
                 }]
                 self._current_chapter_idx = 0
@@ -9193,7 +9197,7 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
                 track_combo.selected_items = set()
                 track_combo.setText(no_track_label)
             else:
-                track_combo.options_list = list(tracks)
+                track_combo.options_list = list(tracks.keys())
                 track_combo.selected_items = set()
                 track_combo.setText(self.txt("txt_all_tracks"))
 
@@ -9227,7 +9231,7 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
             indices = []
             for name in track_names:
                 if name in all_tracks:
-                    indices.append(all_tracks.index(name) + 1)
+                    indices.append(all_tracks[name])
             return sorted(indices)
         except Exception as e:
             from osdoc import log_error
@@ -9541,9 +9545,9 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
         # Sync snapshot back (engine mutates prefs["source_snapshot"] in-place)
         prefs = getattr(self, '_assembly_prefs', {}) or {}
         updated_snapshot = prefs.get("source_snapshot")
-        if updated_snapshot and hasattr(self, '_transcription_source'):
+        if updated_snapshot and getattr(self, '_transcription_source', None):
             new_filtered = updated_snapshot.get("filtered_tl_name")
-            if new_filtered and self._transcription_source.get("filtered_tl_name") != new_filtered:
+            if new_filtered and getattr(self, '_transcription_source', {}).get("filtered_tl_name") != new_filtered:
                 self._transcription_source["filtered_tl_name"] = new_filtered
                 try:
                     _p = self.engine.load_preferences() or {}
@@ -9554,11 +9558,11 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
 
         # RAM cleanup
         try:
-            import gc
-            self._assembly_thread = None
+            if hasattr(self, '_assembly_thread') and self._assembly_thread is not None:
+                self._assembly_thread.deleteLater()
+                self._assembly_thread = None
             self._assembly_sigs   = None
             self._assembly_prefs  = None
-            gc.collect()
         except Exception:
             pass
 
@@ -9784,7 +9788,7 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
         lbl_ultra.setStyleSheet(f"color: {config.FG_COLOR}; font-family: {config.UI_FONT_NAME}; font-size: 10pt;")
         
         info_ultra = QLabel()
-        _src_dir = os.path.dirname(os.path.abspath(__file__))
+        _src_dir = os.path.dirname(os.path.realpath(__file__))
         _prod_assets_dir = os.path.join(_src_dir, "layout")
         _dev_assets_dir = os.path.join(os.path.dirname(_src_dir), "assets", "layout")
         _assets_dir = _prod_assets_dir if os.path.exists(_prod_assets_dir) else _dev_assets_dir
@@ -10091,6 +10095,23 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
         self.bar_processing.setFixedWidth(400)
         layout.addWidget(self.bar_processing, 0, Qt.AlignCenter)
 
+        layout.addSpacing(15)
+        
+        self.lbl_align_status = QLabel(self.txt("lbl_initializing") if hasattr(self, 'txt') else "Aligning", page)
+        self.lbl_align_status.setAlignment(Qt.AlignCenter)
+        self.lbl_align_status.setStyleSheet(
+            f"color: {config.NOTE_COL}; font-size: 13pt;"
+            f" font-family: '{config.UI_FONT_NAME}'; background: transparent;"
+        )
+        self.lbl_align_status.hide()  # Hidden by default until alignment starts
+        layout.addWidget(self.lbl_align_status)
+        layout.addSpacing(15)
+        
+        self.bar_align = LiquidProgressBar(page)
+        self.bar_align.setFixedWidth(400)
+        self.bar_align.hide()
+        layout.addWidget(self.bar_align, 0, Qt.AlignCenter)
+
         # ── First-run hint label (shown only when model is being used for the first time) ──
         layout.addSpacing(20)
         self.lbl_first_run_hint = QLabel("", page)
@@ -10114,6 +10135,13 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
     def _update_processing_progress(self, val: int):
         if hasattr(self, 'bar_processing'):
             self.bar_processing.set_value(val)
+
+    def _update_align_progress(self, val: int):
+        if hasattr(self, 'bar_align'):
+            if self.bar_align.isHidden():
+                self.bar_align.show()
+                self.lbl_align_status.show()
+            self.bar_align.set_value(val)
 
     def _build_page_editor(self) -> QWidget:
         page = QWidget()
@@ -10203,6 +10231,20 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
         self.go_to_page(1)
 
     def _on_start_analysis(self):
+        # ── Script Validation Prompt ────────────────────────────────────────────
+        if hasattr(self, 'text_script') and not self.text_script.toPlainText().strip():
+            from PySide6.QtWidgets import QMessageBox
+            reply = QMessageBox.question(
+                self,
+                "No Script Provided",
+                "You haven't entered a script in the Script Analysis tab.\n\nProviding a script greatly improves AI transcription accuracy.\n\nDo you want to go back and add a script?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes
+            )
+            if reply == QMessageBox.Yes:
+                self.go_to_page(0)
+                return
+
         # ── Language validation ─────────────────────────────────────────────────
         raw_lang_txt = self._combo_lang.text() if hasattr(self, '_combo_lang') else ''
         _lang_is_valid = raw_lang_txt.strip() and raw_lang_txt in set(config.SUPPORTED_LANGUAGES.values())
@@ -10395,13 +10437,14 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
             "filler_words": [w.strip() for w in self.txt_fillers.toPlainText().split(',') if w.strip()],
             "timeline_name": selected_tl_name or None,
             "track_indices": track_indices or None,
-            "ai_initial_prompt_override": self.text_script.toPlainText().strip() if hasattr(self, 'text_script') else "",
+            "script_content": self.text_script.toPlainText().strip() if hasattr(self, 'text_script') else "",
         }
 
         
         # 4. Start QThread targeting self.engine.run_analysis_pipeline()
         self._analysis_worker = AnalysisWorker(self.engine, 'run_analysis_pipeline', settings)
         self._analysis_worker.progress.connect(self._on_analysis_progress)
+        self._analysis_worker.align_progress.connect(self._update_align_progress)
         self._analysis_worker.status.connect(self._on_analysis_status)
         self._analysis_worker.finished_ok.connect(self._on_analysis_finished)
         self._analysis_worker.error.connect(self._on_analysis_error)
@@ -10429,8 +10472,14 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
             self.lbl_first_run_hint.hide()
             if hasattr(self, '_hint_opacity'):
                 self._hint_opacity.setOpacity(0.0)
-        if hasattr(self, 'lbl_processing_status'):
-            self.lbl_processing_status.setText(f"Error: {err}")
+        
+        dlg = CustomMsgBox(self, self.txt("lbl_error"), f"Analysis failed:\n{err}", self.txt("btn_ok"))
+        dlg.exec()
+        
+        # Reset UI to Page 0 and show panels again
+        self.go_to_page(0)
+        if hasattr(self, '_panel_left'): self._panel_left.show()
+        if hasattr(self, '_panel_right'): self._panel_right.show()
 
     def _on_analysis_finished(self, words_data, segments_data):
         # Stop hint rotation and animations on finish
@@ -10458,7 +10507,10 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
 
 
         if not words_data:
-            dlg = CustomMsgBox(self, self.txt("msg_analysis_failed"), self.txt("msg_the_transcription_process"), self.txt("btn_ok"))
+            err_msg = self.txt("msg_no_speech_detected")
+            if err_msg == "msg_no_speech_detected":
+                err_msg = "No speech was detected in the selected audio track.\nPlease ensure the track is not muted or empty in DaVinci Resolve."
+            dlg = CustomMsgBox(self, self.txt("msg_analysis_failed"), err_msg, self.txt("btn_ok"))
             dlg.exec()
             # Reset UI to Page 0 and show panels again
             self.go_to_page(0)
@@ -10540,23 +10592,17 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
         """
         screen = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
         if screen is None:
-            self.resize(580, 670)
-            if getattr(self, '_is_mac', False):
-                self.showFullScreen()
-            else:
-                self.showMaximized()
+            self.resize(900, 700)
+            self.show()
             return
         sg = screen.availableGeometry()
-        # Center 580x670 on the target screen — this becomes the restore geometry
+        # Center 900x700 on the target screen — this becomes the restore geometry
         self.setGeometry(
-            sg.x() + (sg.width()  - 580) // 2,
-            sg.y() + (sg.height() - 670) // 2,
-            580, 670
+            sg.x() + (sg.width()  - 900) // 2,
+            sg.y() + (sg.height() - 700) // 2,
+            900, 700
         )
-        if getattr(self, '_is_mac', False):
-            self.showFullScreen()
-        else:
-            self.showMaximized()
+        self.show()
 
     # ------------------------------------------------------------------
     # Action handlers (stubs — logic added in later stages)
