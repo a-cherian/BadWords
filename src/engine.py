@@ -1754,8 +1754,11 @@ except Exception as e:
             # Switch to Indeterminate during model check phase
             update_progress(-1)
 
-            # Check/Download logic for Faster-Whisper
-            if not self.check_model_exists(model):
+            ai_use_whisperjav = saved_prefs.get('ai_use_whisperjav_for_zh', True)
+            is_wj = ai_use_whisperjav and lang and str(lang).lower().strip() in ("zh", "yue", "zh-tw", "zh-cn", "ja", "japanese")
+
+            # Check/Download logic for Faster-Whisper (Skip if using whisperjav)
+            if not is_wj and not self.check_model_exists(model):
                 update_status(self.txt("status_downloading_model"))
                 dl_ok = self.download_whisper_model_interactive(
                     model,
