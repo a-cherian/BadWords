@@ -1998,9 +1998,13 @@ except Exception as e:
                         "status": status,
                         "seg_start": seg_start, "seg_end": seg_end,
                         "is_segment_start": is_first,
-                        "type": "word",
+                        "type": w.get("type", "word"),
                         "id": 0
                     }
+                    if w_obj["type"] == "silence" or raw_txt == "[SILENCE]":
+                        w_obj["type"] = "silence"
+                        w_obj["status"] = "silence"
+                        w_obj["selected"] = False
                     
                     if is_hallucination:
                         w_obj['_is_hallucination'] = True  # CRITICAL: Keep tag alive for Enforcer
