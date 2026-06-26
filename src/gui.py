@@ -9165,6 +9165,8 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
             srt_name = state.get("srt_name")
             if srt_content and srt_name:
                 try:
+                    srt_content = self.engine.scale_srt_timestamps(srt_content, 0.9)
+                    
                     temp_dir = self.engine.os_doc.get_temp_folder()
                     srt_path = os.path.join(temp_dir, srt_name)
                     with open(srt_path, 'w', encoding='utf-8') as f:
