@@ -56,6 +56,7 @@ def main():
     parser.add_argument("--lang",   type=str, default="auto",  help="Language code or 'auto' (default: auto).")
     parser.add_argument("--device", type=str, default="Auto",  help="Device to use: Auto, CPU, or GPU (default: Auto).")
     parser.add_argument("--fps",    type=float, default=24.0,  help="Timeline FPS for timecode conversion (default: 24.0).")
+    parser.add_argument("--script", type=str, default=None,   help="Optional path to a script/transcript text file for comparison.")
 
     args = parser.parse_args()
 
@@ -77,6 +78,8 @@ def main():
     print(f"Project Root: {project_root}")
     print(f"Output Dir:   {output_dir}")
     print(f"Model: {args.model} | Lang: {args.lang} | Device: {args.device} | FPS: {args.fps}")
+    if args.script:
+        print(f"Script:       {args.script}")
     print(f"--------------------------------------------------")
 
     os_doc = OSDoctor()
@@ -92,16 +95,40 @@ def main():
         'timeline_name': os.path.basename(input_path),
     }
 
+    if args.script:
+        script_path = os.path.abspath(args.script)
+        if not os.path.exists(script_path):
+            print(f"[ERROR] Script file not found: {script_path}")
+            sys.exit(1)
+        with open(script_path, 'r', encoding='utf-8') as f:
+            settings['script_content'] = f.read()
+
     # ── Progress Callbacks ─────────────────────────────────────────────────────
     def status_cb(msg):
         print(f"\n[STATUS] {msg}")
 
+    _progress_start = [None]  # mutable cell so the closure can write to it
+
     def progress_cb(val):
-        if val > 0:
-            # Simple text progress bar
-            filled = int(val / 5)
-            bar = '█' * filled + '░' * (20 - filled)
-            print(f"\r  [{bar}] {val}%", end='', flush=True)
+        if val <= 0:
+            return
+        now = time.time()
+        if _progress_start[0] is None:
+            _progress_start[0] = now
+
+        elapsed = now - _progress_start[0]
+        filled  = int(val / 5)
+        bar     = '█' * filled + '░' * (20 - filled)
+
+        # Only show ETA once we have a meaningful sample (>2% done)
+        if val >= 2 and elapsed > 0:
+            secs_left = int(elapsed / val * (100 - val))
+            m, s = divmod(secs_left, 60)
+            eta_str = f"ETA ~{m}m {s:02d}s"
+        else:
+            eta_str = "ETA --:--"
+
+        print(f"\r  [{bar}] {val:3d}%  {eta_str}   ", end='', flush=True)
 
     start_time = time.time()
 
@@ -125,9 +152,21 @@ def main():
         sys.exit(1)
 
     # ── Save outputs ───────────────────────────────────────────────────────────
+    def _safe_path(path: str) -> str:
+        """If path exists, return a new path with an incrementing suffix (_1, _2, …)."""
+        if not os.path.exists(path):
+            return path
+        root, ext = os.path.splitext(path)
+        n = 1
+        while True:
+            candidate = f"{root}_{n}{ext}"
+            if not os.path.exists(candidate):
+                return candidate
+            n += 1
+
     base_name       = os.path.splitext(os.path.basename(input_path))[0]
-    final_json_path = os.path.join(output_dir, f"{base_name}_words.json")
-    final_srt_path  = os.path.join(output_dir, f"{base_name}.srt")
+    final_json_path = _safe_path(os.path.join(output_dir, f"{base_name}_words.json"))
+    final_srt_path  = _safe_path(os.path.join(output_dir, f"{base_name}.srt"))
 
     # Write the JSON directly
     import json

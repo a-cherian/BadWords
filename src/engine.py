@@ -1104,15 +1104,22 @@ except Exception as e:
     # 2. AUDIO PROCESSING (FFMPEG)
     # ==========================================
 
-    def normalize_audio(self, input_path):
+    def normalize_audio(self, input_path, temp_dir=None):
         """
         STAGE 9 FIX: Gentle processing only — preserves micro-pauses between stutters.
         Removed loudnorm (was raising noise floor and masking silence gaps).
         Using a very light compressor just to catch hard peaks, nothing more.
+
+        _norm file is always written to temp_dir (defaults to the BadWords temp
+        folder) to avoid cluttering the source/footage directories.
         """
         # FIX KR-04: użyj splitext zamiast replace() — bezpieczne dla .WAV i innych rozszerzeń
-        base, ext = os.path.splitext(input_path)
-        norm_path = base + "_norm" + ext
+        base_name = os.path.splitext(os.path.basename(input_path))[0]
+        _, ext    = os.path.splitext(input_path)
+        out_ext   = ".wav" if ext.lower() not in (".wav", ".mp3", ".flac", ".aac") else ext
+        if temp_dir is None:
+            temp_dir = self.os_doc.get_temp_folder()
+        norm_path = os.path.join(temp_dir, base_name + "_norm" + out_ext)
         filter_chain = (
             "highpass=f=80, "
             "acompressor=threshold=-15dB:ratio=2:attack=10:release=50"
@@ -1127,11 +1134,16 @@ except Exception as e:
             log_error(f"normalize_audio: FFmpeg failed, returning original: {e}")
             return input_path
     
-    def create_slow_motion_audio(self, input_path, speed_factor):
+    def create_slow_motion_audio(self, input_path, speed_factor, temp_dir=None):
         # STAGE 9 FIX: Single atempo filter (speed_factor driven by caller).
         # Multi-chained atempo was compounding distortion; one pass is cleaner.
-        base, ext = os.path.splitext(input_path)
-        slow_path = f"{base}_slow{ext}"
+        #
+        # _slow file is always written to temp_dir (defaults to the BadWords temp
+        # folder) to avoid cluttering the source/footage directories.
+        base_name = os.path.splitext(os.path.basename(input_path))[0]
+        if temp_dir is None:
+            temp_dir = self.os_doc.get_temp_folder()
+        slow_path = os.path.join(temp_dir, f"{base_name}_slow.wav")
         filter_chain = f"atempo={speed_factor}"
         cmd = [self.ffmpeg_cmd, "-y", "-i", input_path, "-filter:a", filter_chain, "-vn", slow_path]
         try:
@@ -1480,13 +1492,13 @@ except Exception as e:
             # Stretches silence windows so FFmpeg can detect them with the same
             # precision as the transcription path.
             update_status(self.txt("status_slow"))
-            slow_wav = self.create_slow_motion_audio(wav_path, SLOW_FACTOR)
+            slow_wav = self.create_slow_motion_audio(wav_path, SLOW_FACTOR, temp_dir=temp_dir)
             analysis_wav = slow_wav if slow_wav != wav_path else wav_path
 
             update_progress(40)
 
             # STEP 2: Normalize — same filter chain as transcription path.
-            normalized_wav = self.normalize_audio(analysis_wav)
+            normalized_wav = self.normalize_audio(analysis_wav, temp_dir=temp_dir)
             target_wav = normalized_wav
 
             update_progress(55)
@@ -1725,25 +1737,42 @@ except Exception as e:
                 log_error("Render failed.")
                 return None, None
 
-            
+            # ── Video → WAV extraction (CLI mode: audio_path may be a video file) ──────
+            _video_exts = {".mov", ".mp4", ".m4v", ".mkv", ".avi", ".mxf", ".mts", ".m2ts"}
+            if os.path.splitext(wav_path)[1].lower() in _video_exts:
+                update_status("Extracting audio from video...")
+                _extracted_wav = os.path.join(temp_dir, f"{unique_id}_src.wav")
+                _ex_cmd = [
+                    self.ffmpeg_cmd, "-y", "-i", wav_path,
+                    "-vn", "-ar", "48000", "-ac", "1", _extracted_wav
+                ]
+                try:
+                    subprocess.run(_ex_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   check=True, **self.os_doc.get_subprocess_kwargs())
+                    log_info(f"[VideoExtract] Extracted audio to {_extracted_wav}")
+                    wav_path = _extracted_wav
+                except Exception as _ex_err:
+                    log_error(f"[VideoExtract] FFmpeg audio extraction failed: {_ex_err}")
+                    return None, None
+
             update_progress(50)
 
-            # 1. SLOW DOWN
+            # 1. SLOW DOWN — intermediates go to temp_dir, not alongside the source
             current_wav_path = wav_path
             time_scale_correction = 1.0
             
             if USE_SLOW_MODE:
                 update_status(self.txt("status_slow"))
-                slow_wav = self.create_slow_motion_audio(wav_path, SLOW_FACTOR)
+                slow_wav = self.create_slow_motion_audio(wav_path, SLOW_FACTOR, temp_dir=temp_dir)
                 if slow_wav != wav_path:
                     current_wav_path = slow_wav
                     time_scale_correction = SLOW_FACTOR
             
             update_progress(75)
 
-            # 2. NORMALIZE
+            # 2. NORMALIZE — also written to temp_dir
             # (Silently normalizes audio under the fast motion process without flashing screen)
-            normalized_wav = self.normalize_audio(current_wav_path)
+            normalized_wav = self.normalize_audio(current_wav_path, temp_dir=temp_dir)
             target_wav = normalized_wav
 
             update_progress(100)
