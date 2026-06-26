@@ -1847,6 +1847,42 @@ class ResolveHandler:
             else:
                 ET.SubElement(audio_el, "track")
 
+            # ── 6.5 Group Linked Clips ────────────────────────────────
+            from collections import defaultdict
+            clip_groups = defaultdict(list)
+            for track_type in ["video", "audio"]:
+                for track_idx, track_el in enumerate(xmeml.findall(f".//media/{track_type}/track")):
+                    clip_idx = 0
+                    for clipitem in track_el.findall("clipitem"):
+                        clip_idx += 1
+                        file_el = clipitem.find(".//file")
+                        file_id = file_el.attrib.get('id') if file_el is not None else ""
+                        start = clipitem.find("start").text if clipitem.find("start") is not None else ""
+                        end = clipitem.find("end").text if clipitem.find("end") is not None else ""
+                        src_in = clipitem.find("in").text if clipitem.find("in") is not None else ""
+                        src_out = clipitem.find("out").text if clipitem.find("out") is not None else ""
+                        
+                        clip_groups[(file_id, start, end, src_in, src_out)].append({
+                            "elem": clipitem,
+                            "id": clipitem.attrib.get("id", ""),
+                            "mediatype": track_type,
+                            "trackindex": str(track_idx + 1),
+                            "clipindex": str(clip_idx)
+                        })
+
+            groupindex = 1
+            for key, items in clip_groups.items():
+                if len(items) > 1:
+                    for item in items:
+                        for other in items:
+                            link_el = ET.SubElement(item["elem"], "link")
+                            ET.SubElement(link_el, "linkclipref").text = other["id"]
+                            ET.SubElement(link_el, "mediatype").text = other["mediatype"]
+                            ET.SubElement(link_el, "trackindex").text = other["trackindex"]
+                            ET.SubElement(link_el, "clipindex").text = other["clipindex"]
+                            ET.SubElement(link_el, "groupindex").text = str(groupindex)
+                    groupindex += 1
+
             # ── 7. Write XML with proper declaration ──────────────────
             tree = ET.ElementTree(xmeml)
             raw_bytes = ET.tostring(xmeml, encoding="unicode", xml_declaration=False)
