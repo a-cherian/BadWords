@@ -739,12 +739,20 @@ except Exception as e:
                 
                 import glob
                 import shutil
-                srt_files = glob.glob(os.path.join(output_dir, unique_name + "*.srt"))
-                if not srt_files:
+                
+                actual_srt = None
+                wj_srt = os.path.join(output_dir, f"{unique_name}.zh.whisperjav.srt")
+                if os.path.exists(wj_srt):
+                    actual_srt = wj_srt
+                else:
+                    srt_files = glob.glob(os.path.join(output_dir, unique_name + "*.srt"))
+                    if srt_files:
+                        actual_srt = srt_files[0]
+                        
+                if not actual_srt:
                     log_error(f"Whisperjav finished but {unique_name}*.srt not found in {output_dir}.")
                     raise FileNotFoundError(f"Whisperjav output {unique_name}*.srt not found.")
                 
-                actual_srt = srt_files[0]
                 srt_file = os.path.join(output_dir, unique_name + ".srt")
                 if actual_srt != srt_file:
                     shutil.copy(actual_srt, srt_file)
@@ -1367,6 +1375,47 @@ except Exception as e:
 
         return result if result else [(0.0, total_duration)]
 
+    def auto_tune_silence_db(self, wav_path, json_data, min_dur, time_scale):
+        # 1. Parse JSON to find target gaps (gaps > min_dur)
+        words = []
+        is_wj = json_data.get("is_whisperjav", False)
+        if is_wj:
+            for seg in json_data.get('segments', []):
+                chunk = seg.get('words', [])
+                if chunk: words.extend(chunk)
+        else:
+            for seg in json_data.get('segments', []):
+                if 'words' in seg: words.extend(seg['words'])
+                
+        if not words:
+            log_info("[Auto-Tune] No words found in JSON, using default -42dB.")
+            return self.detect_silence(wav_path, -42.0, min_dur)
+            
+        target_silence_duration = 0.0
+        for i in range(len(words) - 1):
+            w1, w2 = words[i], words[i+1]
+            gap = w2.get('start', 0) - w1.get('end', 0)
+            if gap >= min_dur:
+                target_silence_duration += gap
+                
+        # 2. Sweep over dB levels and find best match
+        sweep_levels = [-55.0, -50.0, -45.0, -40.0, -35.0, -30.0, -25.0, -20.0]
+        best_ranges = None
+        best_error = float('inf')
+        best_db = -42.0
+        
+        for db in sweep_levels:
+            ranges = self.detect_silence(wav_path, db, min_dur)
+            total_dur = sum((r['e'] - r['s']) for r in ranges)
+            error = abs(total_dur - target_silence_duration)
+            if error < best_error:
+                best_error = error
+                best_db = db
+                best_ranges = ranges
+                
+        log_info(f"[Auto-Tune] Optimal silence threshold found at {best_db}dB (Error: {best_error:.2f}s).")
+        return best_ranges if best_ranges is not None else self.detect_silence(wav_path, -42.0, min_dur)
+
     # ==========================================
     # 2.5 HELPER: ENFORCE HALLUCINATION STATUS
     # ==========================================
@@ -1584,10 +1633,29 @@ except Exception as e:
                     try: os.remove(p)
                     except Exception as e:
                         log_error(f"run_fast_silence_pipeline cleanup: cannot remove {p}: {e}")
-            if wav_path and os.path.exists(wav_path):
+            if wav_path and os.path.exists(wav_path) and wav_path != settings.get('audio_path'):
                 try: os.remove(wav_path)
                 except Exception as e:
                     log_error(f"run_fast_silence_pipeline cleanup: cannot remove wav: {e}")
+    def scale_srt_timestamps(self, srt_content, factor):
+        import re
+        def repl(match):
+            def scale_time(t_str):
+                h, m, s, ms = map(int, re.split('[:,]', t_str))
+                total_s = h * 3600 + m * 60 + s + ms / 1000.0
+                total_s *= factor
+                new_h = int(total_s // 3600)
+                new_m = int((total_s % 3600) // 60)
+                new_s = int(total_s % 60)
+                new_ms = int(round((total_s % 1) * 1000))
+                if new_ms >= 1000:
+                    new_ms -= 1000
+                    new_s += 1
+                return f"{new_h:02d}:{new_m:02d}:{new_s:02d},{new_ms:03d}"
+            
+            return f"{scale_time(match.group(1))} --> {scale_time(match.group(2))}"
+            
+        return re.sub(r'(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})', repl, srt_content)
 
 
     def run_analysis_pipeline(self, settings, callback_status=None, callback_progress=None, callback_align_progress=None):
@@ -1850,12 +1918,13 @@ except Exception as e:
             # Cleanup
             for p in [wav_path, current_wav_path, normalized_wav]:
                 if p and os.path.exists(p) and p != wav_path:
-                    try: pass # os.remove(p)
+                    try: os.remove(p)
                     except Exception as e:
                         log_error(f"run_analysis_pipeline cleanup: cannot remove {p}: {e}")
-            try: pass # os.remove(wav_path)
-            except Exception as e:
-                log_error(f"run_analysis_pipeline cleanup: cannot remove wav: {e}")
+            if wav_path != settings.get('audio_path'):
+                try: os.remove(wav_path)
+                except Exception as e:
+                    log_error(f"run_analysis_pipeline cleanup: cannot remove wav: {e}")
 
             update_status(self.txt("status_process"))
             with open(json_path, 'r', encoding='utf-8') as f:
@@ -1866,9 +1935,13 @@ except Exception as e:
                 try:
                     with open(srt_path, 'r', encoding='utf-8') as f:
                         self.current_srt_content = f.read()
-                        self.current_srt_name = os.path.basename(srt_path)
+                    self.current_srt_name = os.path.basename(srt_path)
                 except Exception as e:
-                    log_error(f"Failed to read SRT: {e}")
+                    log_error(f"Failed to read/scale SRT: {e}")
+
+            if saved_prefs.get('auto_tune_silence', True):
+                update_status("[Auto-Tune] Finding optimal silence threshold...")
+                silence_ranges = self.auto_tune_silence_db(target_wav, data, silence_min_dur, time_scale_correction)
 
             words_data, segments_data = self._build_data_structure(
                 data, silence_ranges, filler_words, fps, 
