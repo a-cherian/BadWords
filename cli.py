@@ -57,6 +57,7 @@ def main():
     parser.add_argument("--device", type=str, default="Auto",  help="Device to use: Auto, CPU, or GPU (default: Auto).")
     parser.add_argument("--fps",    type=float, default=24.0,  help="Timeline FPS for timecode conversion (default: 24.0).")
     parser.add_argument("--script", type=str, default=None,   help="Optional path to a script/transcript text file for comparison.")
+    parser.add_argument("--output", type=str, default=None,   help="Optional output directory (default: <project_root>/output).")
 
     args = parser.parse_args()
 
@@ -68,7 +69,12 @@ def main():
     # Climb up from the audio file's folder to find the numbered project root
     audio_dir    = os.path.dirname(input_path)
     project_root = _find_project_root(audio_dir)
-    output_dir   = os.path.join(project_root, "output")
+    
+    if args.output:
+        output_dir = os.path.abspath(args.output)
+    else:
+        output_dir = os.path.join(project_root, "output")
+        
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"==================================================")
