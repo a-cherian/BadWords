@@ -2141,7 +2141,7 @@ except Exception as e:
                     }
                     if w_obj["type"] == "silence" or raw_txt == "[SILENCE]":
                         w_obj["type"] = "silence"
-                        w_obj["status"] = "silence"
+                        w_obj["status"] = "silence_mark" if getattr(self, '_is_cli', False) else "silence"
                         w_obj["selected"] = False
                     
                     if is_hallucination:
@@ -2215,9 +2215,9 @@ except Exception as e:
              if s_end - s_start > 0.1:
                  final_words.append({
                      "start": s_start, "end": s_end, "text": "[SILENCE]",
-                     "type": "silence", "status": "silence", "selected": False,
+                     "type": "silence", "status": "silence_mark" if getattr(self, '_is_cli', False) else "silence", "selected": False,
                      "seg_start": 0, "seg_end": 0, "is_segment_start": False,
-                     "words": [{"word": "[SILENCE]", "start": s_start, "end": s_end, "probability": 1.0, "type": "silence", "status": "silence"}]
+                     "words": [{"word": "[SILENCE]", "start": s_start, "end": s_end, "probability": 1.0, "type": "silence", "status": "silence_mark" if getattr(self, '_is_cli', False) else "silence"}]
                  })
 
         if temp_words:
@@ -2772,18 +2772,16 @@ except Exception as e:
             # ──────────────────────────────────────────────────────────────────
             # PRIMARY PATH: EXPORT → CUT → IMPORT  (all timeline types)
             # ──────────────────────────────────────────────────────────────────
-            # We use Resolve's OWN FCP7 XML export as the base, then apply the
-            # op-cuts to it. This preserves ALL clip types: regular video/audio,
-            # adjustment clips, generators, Fusion comps, clips from other sources.
-            # importSourceClips:True tells Resolve to link to EXISTING pool items
-            # (the clips are already there from the user's original timeline),
-            # preventing any source clip duplication or new folder creation.
             xml_success  = False
             xml_tl_name  = None
             src_xml_path = ""  # initialised before try so finally block can reference them
             cut_xml_path = ""
 
             try:
+                bypass_xml = True
+                if bypass_xml:
+                    raise Exception("Bypassing XML assembly path to preserve timeline colors and audio.")
+
                 temp_dir = self.os_doc.get_temp_folder()
                 os.makedirs(temp_dir, exist_ok=True)
                 safe_name = "".join(c for c in new_tl_name if c.isalnum() or c in '_-')
@@ -2818,10 +2816,12 @@ except Exception as e:
                             self.resolve_handler.media_pool.SetCurrentFolder(root_folder)
 
                         # Import modified XML.
-                        # We MUST use importSourceClips: True to prevent "Media Offline" for clips in sub-bins.
+                        # We must use importSourceClips: False so that DaVinci Resolve links the edits
+                        # to the EXISTING Media Pool items. This preserves the user's synced audio
+                        # and Media Pool color tweaks!
                         import_options = {
                             "timelineName": new_tl_name,
-                            "importSourceClips": True
+                            "importSourceClips": False
                         }
 
                         new_tl = self.resolve_handler.media_pool.ImportTimelineFromFile(
@@ -2992,9 +2992,28 @@ except Exception as e:
                                             log_info(f"assemble_timeline: Successfully injected SRT from {srt_path}")
                                         else:
                                             log_info("assemble_timeline: Failed to inject SRT via ImportIntoTimeline.")
-                                            # API rejected it. Drop a copy to the Desktop for manual import.
+                                            # API rejected it. Drop a copy to the project's 04_badwords folder for manual import.
                                             desktop_path = os.path.expanduser("~/Desktop")
-                                            dest_srt = os.path.join(desktop_path, "BadWords_Recovered_Subtitles.srt")
+                                            target_dir = desktop_path
+                                            try:
+                                                import re, os
+                                                workspace_path = "/Users/akash/Desktop/videos"
+                                                proj_name = self.resolve_handler.project.GetName()
+                                                for name in [proj_name, original_tl_name]:
+                                                    match = re.search(r'^(\d+)', name)
+                                                    if match:
+                                                        num_str = match.group(1)
+                                                        for item in os.listdir(workspace_path):
+                                                            if os.path.isdir(os.path.join(workspace_path, item)):
+                                                                if item.startswith(f"{num_str} -") or item.startswith(f"{num_str} ") or item.startswith(f"{num_str}_") or item == num_str:
+                                                                    bw_dir = os.path.join(workspace_path, item, "04_badwords")
+                                                                    os.makedirs(bw_dir, exist_ok=True)
+                                                                    target_dir = bw_dir
+                                                                    break
+                                                    if target_dir != desktop_path: break
+                                            except Exception:
+                                                pass
+                                            dest_srt = os.path.join(target_dir, "BadWords_Recovered_Subtitles.srt")
                                             import shutil
                                             try:
                                                 shutil.copy(srt_path, dest_srt)
@@ -3110,7 +3129,7 @@ except Exception as e:
                 log_info(f"assemble_timeline: Fallback succeeded → '{new_tl_name}'")
                 
                 # Add an empty subtitle track to the fallback timeline
-                curr_tl = self.resolve_handler.get_current_timeline()
+                curr_tl = self.resolve_handler.project.GetCurrentTimeline()
                 if curr_tl and hasattr(curr_tl, 'AddTrack'):
                     log_info("assemble_timeline: Adding empty subtitle track to the fallback timeline...")
                     curr_tl.AddTrack("subtitle")

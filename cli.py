@@ -91,6 +91,7 @@ def main():
     os_doc = OSDoctor()
     engine = AudioEngine(os_doc, resolve_handler=None)
     engine._cli_fps = args.fps  # Store FPS for headless use
+    engine._is_cli = True
 
     settings = {
         'audio_path':    input_path,
@@ -99,6 +100,7 @@ def main():
         'device':        args.device,
         'skip_assembly': True,          # Bypass DaVinci Resolve timeline injection
         'timeline_name': os.path.basename(input_path),
+        'silence_mark':  True,
     }
 
     if args.script:

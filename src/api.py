@@ -447,19 +447,36 @@ class ResolveHandler:
         """
         Calculates the next suffix index for the new Edit timeline.
         """
-        base_name = re.sub(r" BadWords Edit \d+$", "", original_name)
-        
+        # Match old format: "{original} BadWords Edit {idx}"
+        # Match new format: "BW [{idx}] {original}"
+        base_name = original_name
+        import re
+        if original_name.startswith("BW ["):
+            m = re.match(r"BW \[\d+\] (.*)", original_name)
+            if m:
+                base_name = m.group(1)
+        else:
+            base_name = re.sub(r" BadWords Edit \d+$", "", original_name)
+            
         idx = 1
         count_map = self.project.GetTimelineCount()
         for i in range(1, count_map + 1):
             tl = self.project.GetTimelineByIndex(i)
             name = tl.GetName()
-            if name.startswith(f"{base_name} BadWords Edit "):
+            
+            # Match new format "BW [{idx}] {base_name}"
+            if name.startswith("BW [") and name.endswith(base_name):
+                m = re.match(r"BW \[(\d+)\] " + re.escape(base_name), name)
+                if m:
+                    curr_idx = int(m.group(1))
+                    if curr_idx >= idx: idx = curr_idx + 1
+            # Match old format
+            elif name.startswith(f"{base_name} BadWords Edit "):
                 try:
                     curr_idx = int(name.split(" BadWords Edit ")[-1])
                     if curr_idx >= idx: idx = curr_idx + 1
                 except (ValueError, IndexError):
-                    pass  # nazwa nie zawiera poprawnego indeksu — pomijamy
+                    pass
         
         return base_name, idx
 
