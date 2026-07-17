@@ -660,6 +660,11 @@ except Exception as e:
                 wj_current_portion = 1
                 wj_phase = "gen"
                 
+                wj_srt_check = os.path.join(output_dir, f"{unique_name}.zh.whisperjav.srt")
+                if os.path.exists(wj_srt_check) and os.path.getsize(wj_srt_check) > 100:
+                    log_info(f"[Whisperjav] Found existing transcription at {wj_srt_check}, skipping generation...")
+                    cmd = ["echo", "Skipped generation, using cache."]
+                
                 try:
                     process = subprocess.Popen(
                         cmd,
@@ -1391,15 +1396,21 @@ except Exception as e:
             log_info("[Auto-Tune] No words found in JSON, using default -42dB.")
             return self.detect_silence(wav_path, -42.0, min_dur)
             
+        spoken_words = []
+        for w in words:
+            text = w.get('word', w.get('text', '')).strip().upper()
+            if text not in ['[SILENCE]', '[INAUDIBLE]', '']:
+                spoken_words.append(w)
+                
         target_silence_duration = 0.0
-        for i in range(len(words) - 1):
-            w1, w2 = words[i], words[i+1]
+        for i in range(len(spoken_words) - 1):
+            w1, w2 = spoken_words[i], spoken_words[i+1]
             gap = w2.get('start', 0) - w1.get('end', 0)
             if gap >= min_dur:
                 target_silence_duration += gap
                 
         # 2. Sweep over dB levels and find best match
-        sweep_levels = [-55.0, -50.0, -45.0, -40.0, -35.0, -30.0, -25.0, -20.0]
+        sweep_levels = [-55.0, -50.0, -45.0, -40.0, -35.0, -30.0, -25.0, -20.0, -15.0, -10.0, -5.0]
         best_ranges = None
         best_error = float('inf')
         best_db = -42.0
@@ -1407,6 +1418,7 @@ except Exception as e:
         for db in sweep_levels:
             ranges = self.detect_silence(wav_path, db, min_dur)
             total_dur = sum((r['e'] - r['s']) for r in ranges)
+            log_info(f"[Auto-Tune] Tested {db}dB -> Found {total_dur:.2f}s of silence (target: {target_silence_duration:.2f}s).")
             error = abs(total_dur - target_silence_duration)
             if error < best_error:
                 best_error = error
@@ -1915,17 +1927,6 @@ except Exception as e:
 
             # silence_ranges already computed above — reused here for data structure
             
-            # Cleanup
-            for p in [wav_path, current_wav_path, normalized_wav]:
-                if p and os.path.exists(p) and p != wav_path:
-                    try: os.remove(p)
-                    except Exception as e:
-                        log_error(f"run_analysis_pipeline cleanup: cannot remove {p}: {e}")
-            if wav_path != settings.get('audio_path'):
-                try: os.remove(wav_path)
-                except Exception as e:
-                    log_error(f"run_analysis_pipeline cleanup: cannot remove wav: {e}")
-
             update_status(self.txt("status_process"))
             with open(json_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
@@ -1963,6 +1964,17 @@ except Exception as e:
                             mf.write("1")
                 except Exception as e:
                     log_error(f"Failed to save model init marker: {e}")
+
+            # Cleanup moved after Auto-Tune
+            for p in [wav_path, current_wav_path, normalized_wav]:
+                if p and os.path.exists(p) and p != wav_path:
+                    try: os.remove(p)
+                    except Exception as e:
+                        log_error(f"run_analysis_pipeline cleanup: cannot remove {p}: {e}")
+            if wav_path != settings.get('audio_path'):
+                try: os.remove(wav_path)
+                except Exception as e:
+                    log_error(f"run_analysis_pipeline cleanup: cannot remove wav: {e}")
 
             if settings.get('skip_assembly'):
                 log_info("skip_assembly is True. Halting pipeline before DaVinci Resolve injection.")
