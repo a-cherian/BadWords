@@ -534,7 +534,10 @@ class CompareEngine:
         word_mapping = []
         for w_idx, w in enumerate(self.words_data):
             if w.get('type') in ['silence', 'inaudible'] or w.get('is_inaudible') or w.get('_is_hallucination'):
-                w['status'] = w.get('manual_status')
+                if w.get('manual_status'):
+                    w['status'] = w.get('manual_status')
+                elif w.get('status') not in ['silence_mark', 'silence', 'inaudible']:
+                    w['status'] = None
                 w['selected'] = bool(w.get('status'))
                 w['is_auto'] = False
                 continue
