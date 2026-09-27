@@ -663,6 +663,7 @@ TRANS = {
         "btn_analyze_standalone": "Analyze (Standalone)",
         "btn_apply": "Apply",
         "btn_assemble": "Assemble",
+        "btn_remove_silences": "Remove Silences",
         "btn_clear": "Clear",
         "btn_close": "Close",
         "btn_export_project": "Export Project",

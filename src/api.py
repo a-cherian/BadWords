@@ -18,6 +18,8 @@ import time
 import os
 import re
 import threading
+import gc
+import traceback
 
 # Import OSDoctor (as per architecture)
 try:
@@ -2206,3 +2208,60 @@ class ResolveHandler:
             # ALWAYS return to the Edit page, even if the process failed
             if self.resolve:
                 self.resolve.OpenPage("edit")
+    def remove_clips_by_color(self, color="Tan", ripple_delete=True):
+        """Removes all clips of the specified color from the current timeline."""
+        try:
+            if not self.resolve:
+                return False, "DaVinci Resolve API not initialized."
+                
+            project_manager = self.resolve.GetProjectManager()
+            project = project_manager.GetCurrentProject()
+            if not project:
+                return False, "No project is currently open."
+            
+            timeline = project.GetCurrentTimeline()
+            if not timeline:
+                return False, "No timeline is currently open."
+
+            clips_to_delete = []
+            
+            # Iterate over all tracks (video and audio)
+            track_types = ["video", "audio"]
+            for t_type in track_types:
+                track_count = timeline.GetTrackCount(t_type)
+                for track_idx in range(1, track_count + 1):
+                    items = timeline.GetItemListInTrack(t_type, track_idx)
+                    if items:
+                        for item in items:
+                            if item.GetClipColor() == color:
+                                clips_to_delete.append(item)
+            
+            if not clips_to_delete:
+                return True, f"No clips with color '{color}' were found on the timeline."
+                
+            # Delete the clips
+            # DeleteClips takes a list of clips and a boolean for ripple delete
+            success = timeline.DeleteClips(clips_to_delete, ripple_delete)
+            
+            num_deleted = len(clips_to_delete)
+            
+            # Clean up memory
+            try:
+                del clips_to_delete
+                del items
+                del timeline
+                del project
+                del project_manager
+            except Exception:
+                pass
+            gc.collect()
+
+            if success:
+                return True, f"Successfully removed {num_deleted} silence clips."
+            else:
+                return False, "DeleteClips returned False."
+
+        except Exception as e:
+            log_error(f"remove_clips_by_color error: {e}")
+            log_error(traceback.format_exc())
+            return False, f"Error deleting clips: {e}"

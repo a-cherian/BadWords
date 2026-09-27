@@ -8679,6 +8679,12 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
         self.btn_assemble.setStyleSheet("QPushButton { background-color: #11703c; color: white; font-weight: bold; border-radius: 4px; border: 1px solid #0a4d28; } QPushButton:hover { background-color: #168f4d; } QPushButton:pressed { background-color: #0d5c31; }")
         l_main.addWidget(self.btn_assemble)
         
+        self.btn_remove_silences = QPushButton(self.txt("btn_remove_silences") if self.txt("btn_remove_silences") != "btn_remove_silences" else "Remove Silences")
+        self.btn_remove_silences.setFixedHeight(35)
+        self.btn_remove_silences.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_remove_silences.setStyleSheet("QPushButton { background-color: #701111; color: white; font-weight: bold; border-radius: 4px; border: 1px solid #4d0a0a; } QPushButton:hover { background-color: #8f1616; } QPushButton:pressed { background-color: #5c0d0d; }")
+        l_main.addWidget(self.btn_remove_silences)
+        
         self._build_marker_radio_buttons()
         self.activities["main_panel"] = _wrap_activity(p_main)
         
@@ -8769,6 +8775,7 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
         
         # Right Panel Signals
         self.btn_assemble.clicked.connect(self._on_assemble)
+        self.btn_remove_silences.clicked.connect(self._on_remove_silences)
         self.btn_import_proj.clicked.connect(self._on_import_project)
         self.btn_export_proj.clicked.connect(self._on_export_project)
         
@@ -11374,3 +11381,18 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
                 self.closeEvent_callback()
         else:
             event.ignore()
+
+    def _on_remove_silences(self):
+        from PySide6.QtWidgets import QMessageBox
+        
+        reply = QMessageBox.question(
+            self, 'Remove Silences',
+            'This will delete all clips marked as silences (Tan colored) from the active DaVinci Resolve timeline using Ripple Delete. Continue?',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            success, msg = self.engine.remove_silences_from_timeline(ripple_delete=True)
+            if success:
+                QMessageBox.information(self, 'Success', msg)
+            else:
+                QMessageBox.warning(self, 'Error', msg)

@@ -3196,3 +3196,8 @@ except Exception as e:
             log_error(f"Assembly Critical Error: {e}")
             traceback.print_exc()
             return False, None, None, None
+    def remove_silences_from_timeline(self, ripple_delete=True):
+        if not self.resolve_handler:
+            return False, "Resolve API not active."
+        # 'Tan' is the default color for silence_mark
+        return self.resolve_handler.remove_clips_by_color(color="Tan", ripple_delete=ripple_delete)
