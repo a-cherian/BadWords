@@ -1318,7 +1318,11 @@ class ResolveHandler:
                 
         if not target_tl:
             log_error(f"Could not find timeline '{original_timeline_name}'.")
-            return None, None
+            if self.timeline:
+                target_tl = self.timeline
+                log_info(f"get_optimal_source_item: Falling back to active timeline '{target_tl.GetName()}'.")
+            else:
+                return None, None
 
         # 2. Zlicz klipy na wszystkich ścieżkach
         total_v_items = 0
@@ -1383,7 +1387,7 @@ class ResolveHandler:
         # WARUNEK B (Cały Timeline jako klip)
         log_info("Auto-Sourcing: Condition B (Complex assembly). Using timeline from Media Pool.")
         root_folder = self.media_pool.GetRootFolder()
-        timeline_media_item = self.find_timeline_item_recursive(root_folder, original_timeline_name)
+        timeline_media_item = self.find_timeline_item_recursive(root_folder, target_tl.GetName())
         
         context_type = 'audio' if total_v_items == 0 else 'video'
         

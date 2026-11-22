@@ -38,6 +38,7 @@ import os
 import sys
 import json
 import time
+import glob
 import threading
 import shutil
 import subprocess
@@ -53,6 +54,59 @@ from datetime import timedelta
 import config
 import algorithms
 from osdoc import log_info, log_error
+
+MLX_SUPPORTED_MODELS = {
+    "tiny.en", "tiny", "base.en", "base", "small.en", "small",
+    "medium.en", "medium", "large-v1", "large-v2", "large-v3",
+    "large", "large-v3-turbo", "turbo",
+}
+
+
+def _format_srt_time(seconds):
+    total_ms = max(0, int(round(float(seconds) * 1000)))
+    hours, rem = divmod(total_ms, 3_600_000)
+    minutes, rem = divmod(rem, 60_000)
+    secs, ms = divmod(rem, 1_000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
+
+
+_EN_PROMPT_STOP_TERMS = {
+    "To", "At", "Two", "And", "As", "The", "This", "That", "Now", "Whenever",
+    "Thirty", "Even", "So", "But", "If", "Sure", "Just", "Either", "When",
+    "In", "Of", "On", "For", "It", "Or", "We", "He", "She", "They", "There",
+    "What", "Why", "How", "No", "Not", "My", "Our", "One", "All", "Also",
+    "After", "Before", "However", "Meanwhile", "Because", "Although", "Since",
+    "Yes", "Yeah", "Well", "Actually", "Honestly", "Basically", "Obviously",
+    "Lately", "Previously", "Here", "Some", "Other", "Back", "Over",
+}
+
+
+def _clean_script_for_prompt(script_text):
+    """Extracts unique capitalized proper terms and acronyms from a script for Whisper initial_prompt."""
+    if not script_text:
+        return ""
+    cleaned_lines = []
+    for line in script_text.splitlines():
+        s = re.sub(r'https?://\S+', '', line)
+        s = re.sub(r'\[[^\]]*\]', '', s)
+        s = re.sub(r'^[#*\-—>\s]+', '', s).strip()
+        if not s or s.endswith(':'):
+            continue
+        cleaned_lines.append(s)
+    text = ' '.join(cleaned_lines)
+    raw_terms = re.findall(r"\b(?:[A-Z][A-Za-z0-9.'-]+|[A-Z0-9]{2,})\b", text)
+    seen = set()
+    terms = []
+    for t in raw_terms:
+        t_clean = t.strip(".'-")
+        if not t_clean or t_clean.isdigit() or t_clean in _EN_PROMPT_STOP_TERMS:
+            continue
+        if t_clean not in seen:
+            seen.add(t_clean)
+            terms.append(t_clean)
+            if len(terms) >= 40:
+                break
+    return ", ".join(terms)
 
 def _parse_srt_time(time_str):
     import re
@@ -241,8 +295,10 @@ class AudioEngine:
         # Determine path to local libs for subprocess injection
         self.libs_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "libs")
         
-        # Define local models directory (in install folder)
+        # Define local models directory (in install folder) and system HF hub cache
         self.models_dir = os.path.join(self.os_doc.install_dir, "models")
+        self.hf_hub_cache = os.path.expanduser("~/.cache/huggingface/hub")
+        self._mlx_available_cached = None
         try:
             os.makedirs(self.models_dir, exist_ok=True)
         except Exception as e:
@@ -559,11 +615,56 @@ except Exception as e:
 
 
 
+    def _has_mlx_whisper(self):
+        """Detects Apple Silicon + mlx_whisper availability in the venv Python."""
+        if self._mlx_available_cached is not None:
+            return self._mlx_available_cached
+        if not (self.os_doc.is_mac and platform.machine() == "arm64"):
+            self._mlx_available_cached = False
+            return False
+        try:
+            python_exec = self._get_python_executable()
+            res = subprocess.run(
+                [python_exec, "-c", "import mlx.core, mlx_whisper, stable_whisper"],
+                capture_output=True, text=True, timeout=10,
+                **self.os_doc.get_subprocess_kwargs()
+            )
+            self._mlx_available_cached = (res.returncode == 0)
+        except Exception:
+            self._mlx_available_cached = False
+        return self._mlx_available_cached
+
+    def _model_cache_candidates(self, model_name):
+        if model_name == "large":
+            model_name = "large-v3"
+        candidates = [f"models--Systran--faster-whisper-{model_name}"]
+        if model_name in ("turbo", "large-v3-turbo"):
+            candidates.extend([
+                "models--mobiuslabsgmbh--faster-whisper-large-v3-turbo",
+                "models--mlx-community--whisper-large-v3-turbo",
+            ])
+        elif model_name == "large-v3":
+            candidates.append("models--mlx-community--whisper-large-v3-mlx")
+        else:
+            candidates.append(f"models--mlx-community--whisper-{model_name}-mlx")
+        return candidates
+
+    def _model_exists_in_dir(self, base_dir, model_name):
+        if not base_dir or not os.path.exists(base_dir):
+            return False
+        for folder_name in self._model_cache_candidates(model_name):
+            snapshots_dir = os.path.join(base_dir, folder_name, "snapshots")
+            if os.path.exists(snapshots_dir) and len(os.listdir(snapshots_dir)) > 0:
+                return True
+        return False
+
     def check_model_exists(self, model_name):
-        if model_name == "large": model_name = "large-v3"
-        model_folder = os.path.join(self.models_dir, f"models--Systran--faster-whisper-{model_name}")
-        snapshots_dir = os.path.join(model_folder, "snapshots")
-        return os.path.exists(snapshots_dir) and len(os.listdir(snapshots_dir)) > 0
+        if model_name == "large":
+            model_name = "large-v3"
+        return (
+            self._model_exists_in_dir(self.models_dir, model_name)
+            or self._model_exists_in_dir(self.hf_hub_cache, model_name)
+        )
 
     def run_whisper(self, audio_path, model, lang, verbatim, device_mode, compute_type,
                     filler_words_list=None, initial_prompt=None, progress_callback=None,
@@ -577,10 +678,12 @@ except Exception as e:
         STAGE 6A: initial_prompt injected via repr() for safe quoting in generated script.
         UPDATED v13.0: initial_prompt is now per-language aware via config.get_whisper_prompt_for_lang().
         UPDATED v14.0: True In-Memory Chunking via islands list (NumPy slicing, zero disk I/O).
+        UPDATED v15.0: Apple Silicon MLX GPU acceleration & automatic .srt export for English.
         """
         unique_name = os.path.splitext(os.path.basename(audio_path))[0]
         output_dir = self.os_doc.get_temp_folder()
         json_output_path = os.path.join(output_dir, unique_name + ".json")
+        srt_output_path = os.path.join(output_dir, unique_name + ".srt")
         runner_script_path = os.path.join(output_dir, f"fw_runner_{unique_name}.py")
 
         if model == "large": model = "large-v3"
@@ -604,12 +707,32 @@ except Exception as e:
 
         ai_use_whisperjav = prefs.get('ai_use_whisperjav_for_zh', True)
         is_wj = ai_use_whisperjav and lang and str(lang).lower().strip() in ("zh", "yue", "zh-tw", "zh-cn", "ja", "japanese")
-        
+        use_mlx = (not is_wj) and (model in MLX_SUPPORTED_MODELS) and self._has_mlx_whisper()
+
+        is_english = bool(lang and str(lang).lower().strip() == "en")
+        if is_english and initial_prompt_str:
+            initial_prompt_str = initial_prompt_str.replace("i... i", "I... I")
+
         if not is_wj and script_content:
-            initial_prompt_str = (initial_prompt_str + " " + script_content)[:1000]
+            glossary_terms = _clean_script_for_prompt(script_content)
+            if use_mlx or is_english:
+                if glossary_terms:
+                    initial_prompt_str = f"Um, uh, like, you know, I, I mean... Glossary: {glossary_terms}"
+                elif is_english:
+                    initial_prompt_str = "Um, uh, like, you know, I, I mean..."
+            elif glossary_terms:
+                initial_prompt_str = (initial_prompt_str + " " + glossary_terms)[:900]
+
+        use_system_hf_cache = self._model_exists_in_dir(self.hf_hub_cache, model) or (
+            os.path.exists(self.hf_hub_cache) and not self._model_exists_in_dir(self.models_dir, model)
+        )
+        effective_hf_home = os.path.dirname(self.hf_hub_cache) if use_system_hf_cache else self.models_dir
 
         env = os.environ.copy()
-        env["HF_HOME"] = self.models_dir
+        if not use_system_hf_cache:
+            env["HF_HOME"] = self.models_dir
+        else:
+            env.pop("HF_HOME", None)
         if hasattr(self, 'ffmpeg_cmd') and self.ffmpeg_cmd:
             ffmpeg_dir = os.path.dirname(self.ffmpeg_cmd)
             if ffmpeg_dir:
@@ -803,8 +926,21 @@ except Exception as e:
 
         # ── Chunked mode: in-memory NumPy slicing ────────────────────────────
         use_chunking = islands is not None and len(islands) > 1
+        hf_home_stmt = (
+            f'os.environ["HF_HOME"] = {repr(self.models_dir)}'
+            if not use_system_hf_cache
+            else 'os.environ.pop("HF_HOME", None)'
+        )
+        download_root_expr = repr(self.models_dir) if not use_system_hf_cache else 'None'
+        cpu_threads_val = 8 if fw_device == "cpu" else 4
+        resolved_lang_repr = repr(lang) if lang != 'Auto' else 'None'
+        resolved_prompt_repr = repr(initial_prompt_str) if initial_prompt_str else 'None'
+        no_speech_thresh_val = 0.6 if islands is not None else prefs.get('ai_no_speech_threshold', 0.2)
+        comp_ratio_thresh_val = 2.4 if islands is not None else prefs.get('ai_compression_ratio_threshold', 10.0)
+        single_vad_filter = bool(prefs.get('ai_vad_filter', False) or (lang and str(lang).lower().strip() == 'en'))
+
         if use_chunking:
-            log_info(f"[Chunked] {len(islands)} sound islands → in-memory NumPy slicing.")
+            log_info(f"[Chunked] {len(islands)} sound islands → in-memory NumPy slicing (backend={'MLX' if use_mlx else 'Faster-Whisper'}).")
             script_content = f"""
 import sys, os, json, time
 import numpy as np
@@ -812,9 +948,9 @@ import numpy as np
 os.environ["PATH"] = {repr(self.os_doc.bin_dir)} + os.pathsep + os.environ.get("PATH", "")
 os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
-os.environ["HF_HOME"] = {repr(self.models_dir)}
+{hf_home_stmt}
 libs_dir = {repr(self.libs_dir)}
-if os.path.exists(libs_dir) and libs_dir not in sys.path:
+if sys.version_info[:2] == (3, 14) and os.path.exists(libs_dir) and libs_dir not in sys.path:
     sys.path.insert(0, libs_dir)
 try:
     import stable_whisper
@@ -868,11 +1004,17 @@ try:
     model_size     = {repr(model)}
     target_device  = {repr(fw_device)}
     target_compute = {repr(compute_type)}
-    print(f"[Chunked] Loading model {{model_size}} on {{target_device}} ({{target_compute}})...")
-    model = stable_whisper.load_faster_whisper(
-        model_size, device=target_device, compute_type=target_compute,
-        download_root={repr(self.models_dir)}
-    )
+    USE_MLX        = {repr(use_mlx)}
+    if USE_MLX:
+        import mlx.core as mx
+        print(f"[Chunked] Loading MLX Whisper model {{model_size}} (float16 GPU)...")
+        model = stable_whisper.load_mlx_whisper(model_size, dtype=mx.float16)
+    else:
+        print(f"[Chunked] Loading Faster-Whisper model {{model_size}} on {{target_device}} ({{target_compute}}, threads={cpu_threads_val})...")
+        model = stable_whisper.load_faster_whisper(
+            model_size, device=target_device, compute_type=target_compute,
+            download_root={download_root_expr}, cpu_threads={cpu_threads_val}
+        )
     print("[Chunked] Model loaded. Decoding audio array...")
     audio_array  = decode_audio({repr(audio_path)}, sampling_rate=16000)
     total_chunks = len(ISLANDS)
@@ -889,48 +1031,87 @@ try:
             continue
         print(f"[Chunked] Island {{chunk_idx+1}}/{{total_chunks}}: {{island_start:.2f}}s—{{island_end:.2f}}s")
         
-        chunk_result = model.transcribe(
-            chunk,
-            beam_size={repr(resolved_beam_size)},
-            patience={repr(prefs.get('ai_patience', 1.0))},
-            language={repr(lang) if lang != 'Auto' else 'None'},
-            initial_prompt={repr(initial_prompt_str)},
-            condition_on_previous_text=False,
-            vad_filter={repr(prefs.get('ai_vad_filter', False))},
-            temperature={repr(prefs.get('ai_temperature', 0.0))},
-            no_speech_threshold={0.6 if islands is not None else repr(prefs.get('ai_no_speech_threshold', 0.2))},
-            log_prob_threshold={repr(prefs.get('ai_logprob_threshold', -1.0))},
-            compression_ratio_threshold={2.4 if islands is not None else repr(prefs.get('ai_compression_ratio_threshold', 10.0))},
-            no_repeat_ngram_size={repr(prefs.get('ai_no_repeat_ngram_size', 0))},
-            regroup={repr(prefs.get('ai_regroup', False))},
-            suppress_silence={repr(prefs.get('ai_suppress_silence', False))},
-            q_levels={repr(prefs.get('ai_q_levels', 20))},
-            k_size={repr(prefs.get('ai_k_size', 5))},
-            verbose=False
-        )
+        if USE_MLX:
+            chunk_result = model.transcribe(
+                chunk,
+                language={resolved_lang_repr},
+                initial_prompt={resolved_prompt_repr},
+                condition_on_previous_text=False,
+                temperature={repr(prefs.get('ai_temperature', 0.0))},
+                no_speech_threshold={repr(no_speech_thresh_val)},
+                logprob_threshold={repr(prefs.get('ai_logprob_threshold', -1.0))},
+                compression_ratio_threshold={repr(comp_ratio_thresh_val)},
+                regroup={repr(prefs.get('ai_regroup', False))},
+                suppress_silence={repr(prefs.get('ai_suppress_silence', False))},
+                q_levels={repr(prefs.get('ai_q_levels', 20))},
+                k_size={repr(prefs.get('ai_k_size', 5))},
+                verbose=False
+            )
+        else:
+            chunk_result = model.transcribe(
+                chunk,
+                beam_size={repr(resolved_beam_size)},
+                patience={repr(prefs.get('ai_patience', 1.0))},
+                language={resolved_lang_repr},
+                initial_prompt={repr(initial_prompt_str)},
+                condition_on_previous_text=False,
+                vad_filter={repr(prefs.get('ai_vad_filter', False))},
+                temperature={repr(prefs.get('ai_temperature', 0.0))},
+                no_speech_threshold={repr(no_speech_thresh_val)},
+                log_prob_threshold={repr(prefs.get('ai_logprob_threshold', -1.0))},
+                compression_ratio_threshold={repr(comp_ratio_thresh_val)},
+                no_repeat_ngram_size={repr(prefs.get('ai_no_repeat_ngram_size', 0))},
+                regroup={repr(prefs.get('ai_regroup', False))},
+                suppress_silence={repr(prefs.get('ai_suppress_silence', False))},
+                q_levels={repr(prefs.get('ai_q_levels', 20))},
+                k_size={repr(prefs.get('ai_k_size', 5))},
+                verbose=False
+            )
         if chunk_result.segments:
             for seg in chunk_result.segments:
                 seg_obj = {{
-                    "start": seg.start + island_start,
-                    "end":   seg.end   + island_start,
+                    "start": float(seg.start) + float(island_start),
+                    "end":   float(seg.end)   + float(island_start),
                     "text":  seg.text,
                     "words": []
                 }}
                 if seg.words:
                     for w in seg.words:
+                        w_s = w.start if w.start is not None else seg.start
+                        w_e = w.end if w.end is not None else seg.end
+                        prob = getattr(w, 'probability', 1.0)
                         seg_obj["words"].append({{
                             "word":        w.word,
-                            "start":       w.start + island_start,
-                            "end":         w.end   + island_start,
-                            "probability": w.probability if hasattr(w, 'probability') else 1.0
+                            "start":       float(w_s) + float(island_start),
+                            "end":         float(w_e) + float(island_start),
+                            "probability": float(prob) if prob is not None else 1.0
                         }})
                 output_segments.append(seg_obj)
-                print(f"Segment processed: {{seg.start + island_start:.2f}}s")
+                print(f"Segment processed: {{float(seg.start) + float(island_start):.2f}}s")
                 
         print(f"CHUNK_PROGRESS: {{int((chunk_idx+1)/total_chunks*100)}}")
     final_data = {{"segments": output_segments, "language": {repr(lang)}}}
     with open({repr(json_output_path)}, "w", encoding="utf-8") as f:
         json.dump(final_data, f)
+    time_scale = {repr(float(time_scale_correction))}
+    def _fmt_srt(sec):
+        ms_total = max(0, int(round(float(sec) * 1000)))
+        h, rem = divmod(ms_total, 3600000)
+        m, rem = divmod(rem, 60000)
+        s, ms = divmod(rem, 1000)
+        return f"{{h:02d}}:{{m:02d}}:{{s:02d}},{{ms:03d}}"
+    with open({repr(srt_output_path)}, "w", encoding="utf-8") as sf:
+        cue_idx = 1
+        for seg in output_segments:
+            txt = (seg.get("text") or "").strip()
+            if not txt:
+                continue
+            st = float(seg["start"]) * time_scale
+            en = float(seg["end"]) * time_scale
+            if en <= st:
+                en = st + 0.05
+            sf.write(f"{{cue_idx}}\\n{{_fmt_srt(st)}} --> {{_fmt_srt(en)}}\\n{{txt}}\\n\\n")
+            cue_idx += 1
     print("Transcription Done.")
 except Exception as e:
     print(f"FW_ERROR: {{e}}")
@@ -938,7 +1119,7 @@ except Exception as e:
     sys.exit(1)
 """
         else:
-            # ── Original single-file runner (unchanged) ──────────────────────
+            # ── Single-file runner ───────────────────────────────────────────
             script_content = f"""
 import sys
 import os
@@ -950,10 +1131,10 @@ os.environ["PATH"] = {repr(self.os_doc.bin_dir)} + os.pathsep + os.environ.get("
 
 os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
-os.environ["HF_HOME"] = {repr(self.models_dir)}
+{hf_home_stmt}
 
 libs_dir = {repr(self.libs_dir)}
-if os.path.exists(libs_dir) and libs_dir not in sys.path:
+if sys.version_info[:2] == (3, 14) and os.path.exists(libs_dir) and libs_dir not in sys.path:
     sys.path.insert(0, libs_dir)
 
 try:
@@ -963,39 +1144,55 @@ try:
     model_size = {repr(model)}
     target_device = {repr(fw_device)}
     target_compute = {repr(compute_type)}
+    USE_MLX = {repr(use_mlx)}
     
-    print(f"Loading Stable-Whisper (Faster Backend): {{model_size}} on {{target_device}} ({{target_compute}})...")
-    
-    # Load using stable_whisper wrapper for faster-whisper
-    model = stable_whisper.load_faster_whisper(
-        model_size, 
-        device=target_device, 
-        compute_type=target_compute, 
-        download_root={repr(self.models_dir)}
-    )
-
-    print("Model Loaded Successfully. Starting STABLE Transcription...")
-    
-    # Parameters for strict VERBATIM output (STAGE 9: Unchain for phrasal retakes)
-    result = model.transcribe(
-        {repr(audio_path)}, 
-        beam_size={repr(resolved_beam_size)},
-        patience={repr(prefs.get('ai_patience', 1.0))},
-        language={repr(lang) if lang != "Auto" else "None"},
-        initial_prompt={repr(initial_prompt_str)},
-        condition_on_previous_text={repr(prefs.get('ai_condition_on_prev', False))},
-        vad_filter={repr(prefs.get('ai_vad_filter', False))},
-        temperature={repr(prefs.get('ai_temperature', 0.0))},
-        no_speech_threshold={repr(prefs.get('ai_no_speech_threshold', 0.2))},
-        log_prob_threshold={repr(prefs.get('ai_logprob_threshold', -1.0))},
-        compression_ratio_threshold={repr(prefs.get('ai_compression_ratio_threshold', 10.0))},
-        no_repeat_ngram_size={repr(prefs.get('ai_no_repeat_ngram_size', 0))},
-        # Stable-TS specific flags for alignment precision:
-        regroup={repr(prefs.get('ai_regroup', False))},
-        suppress_silence={repr(prefs.get('ai_suppress_silence', False))},
-        q_levels={repr(prefs.get('ai_q_levels', 20))},
-        k_size={repr(prefs.get('ai_k_size', 5))}
-    )
+    if USE_MLX:
+        import mlx.core as mx
+        print(f"Loading Stable-Whisper (MLX GPU Backend): {{model_size}} (float16)...")
+        model = stable_whisper.load_mlx_whisper(model_size, dtype=mx.float16)
+        print("Model Loaded Successfully. Starting MLX Transcription...")
+        result = model.transcribe(
+            {repr(audio_path)},
+            language={resolved_lang_repr},
+            initial_prompt={resolved_prompt_repr},
+            condition_on_previous_text={repr(prefs.get('ai_condition_on_prev', False))},
+            temperature={repr(prefs.get('ai_temperature', 0.0))},
+            no_speech_threshold={repr(prefs.get('ai_no_speech_threshold', 0.2))},
+            logprob_threshold={repr(prefs.get('ai_logprob_threshold', -1.0))},
+            compression_ratio_threshold={repr(prefs.get('ai_compression_ratio_threshold', 10.0))},
+            regroup={repr(prefs.get('ai_regroup', False))},
+            suppress_silence={repr(prefs.get('ai_suppress_silence', False))},
+            q_levels={repr(prefs.get('ai_q_levels', 20))},
+            k_size={repr(prefs.get('ai_k_size', 5))}
+        )
+    else:
+        print(f"Loading Stable-Whisper (Faster Backend): {{model_size}} on {{target_device}} ({{target_compute}}, threads={cpu_threads_val})...")
+        model = stable_whisper.load_faster_whisper(
+            model_size, 
+            device=target_device, 
+            compute_type=target_compute, 
+            download_root={download_root_expr},
+            cpu_threads={cpu_threads_val}
+        )
+        print("Model Loaded Successfully. Starting STABLE Transcription...")
+        result = model.transcribe(
+            {repr(audio_path)}, 
+            beam_size={repr(resolved_beam_size)},
+            patience={repr(prefs.get('ai_patience', 1.0))},
+            language={resolved_lang_repr},
+            initial_prompt={repr(initial_prompt_str)},
+            condition_on_previous_text={repr(prefs.get('ai_condition_on_prev', False))},
+            vad_filter={repr(single_vad_filter)},
+            temperature={repr(prefs.get('ai_temperature', 0.0))},
+            no_speech_threshold={repr(prefs.get('ai_no_speech_threshold', 0.2))},
+            log_prob_threshold={repr(prefs.get('ai_logprob_threshold', -1.0))},
+            compression_ratio_threshold={repr(prefs.get('ai_compression_ratio_threshold', 10.0))},
+            no_repeat_ngram_size={repr(prefs.get('ai_no_repeat_ngram_size', 0))},
+            regroup={repr(prefs.get('ai_regroup', False))},
+            suppress_silence={repr(prefs.get('ai_suppress_silence', False))},
+            q_levels={repr(prefs.get('ai_q_levels', 20))},
+            k_size={repr(prefs.get('ai_k_size', 5))}
+        )
     
     output_segments = []
     
@@ -1003,8 +1200,8 @@ try:
     if result.segments:
         for segment in result.segments:
             seg_obj = {{
-                "start": segment.start,
-                "end": segment.end,
+                "start": float(segment.start),
+                "end": float(segment.end),
                 "text": segment.text,
                 "words": []
             }}
@@ -1012,16 +1209,18 @@ try:
             # Stable-TS provides high quality word timestamps
             if segment.words:
                 for w in segment.words:
-                    # Stable-ts word object attributes
+                    w_s = w.start if w.start is not None else segment.start
+                    w_e = w.end if w.end is not None else segment.end
+                    prob = getattr(w, 'probability', 1.0)
                     seg_obj["words"].append({{
                         "word": w.word,
-                        "start": w.start,
-                        "end": w.end,
-                        "probability": w.probability if hasattr(w, 'probability') else 1.0
+                        "start": float(w_s),
+                        "end": float(w_e),
+                        "probability": float(prob) if prob is not None else 1.0
                     }})
             
             output_segments.append(seg_obj)
-            print(f"Segment processed: {{segment.start:.2f}}s")
+            print(f"Segment processed: {{float(segment.start):.2f}}s")
 
     final_data = {{
         "segments": output_segments,
@@ -1030,6 +1229,26 @@ try:
     
     with open({repr(json_output_path)}, "w", encoding="utf-8") as f:
         json.dump(final_data, f)
+
+    time_scale = {repr(float(time_scale_correction))}
+    def _fmt_srt(sec):
+        ms_total = max(0, int(round(float(sec) * 1000)))
+        h, rem = divmod(ms_total, 3600000)
+        m, rem = divmod(rem, 60000)
+        s, ms = divmod(rem, 1000)
+        return f"{{h:02d}}:{{m:02d}}:{{s:02d}},{{ms:03d}}"
+    with open({repr(srt_output_path)}, "w", encoding="utf-8") as sf:
+        cue_idx = 1
+        for seg in output_segments:
+            txt = (seg.get("text") or "").strip()
+            if not txt:
+                continue
+            st = float(seg["start"]) * time_scale
+            en = float(seg["end"]) * time_scale
+            if en <= st:
+                en = st + 0.05
+            sf.write(f"{{cue_idx}}\\n{{_fmt_srt(st)}} --> {{_fmt_srt(en)}}\\n{{txt}}\\n\\n")
+            cue_idx += 1
         
     print("Transcription Done.")
 
@@ -1740,8 +1959,9 @@ except Exception as e:
                 fps = self.resolve_handler.fps
             txt_inaudible = "inaudible"
             
-            USE_SLOW_MODE = True 
-            SLOW_FACTOR = 0.90  # STAGE 9 FIX: 10% slowdown only; deep slow destroys phonetic transients
+            is_cjk = bool(lang and str(lang).lower().strip() in ("zh", "yue", "zh-tw", "zh-cn", "ja", "japanese", "ko"))
+            USE_SLOW_MODE = is_cjk
+            SLOW_FACTOR = 0.90  # STAGE 9 FIX: 10% slowdown only for CJK; deep slow destroys phonetic transients
             
             unique_id = f"BW_{int(time.time())}"
             update_progress(10)
@@ -2130,7 +2350,7 @@ except Exception as e:
                 is_hallucination = w.get('_is_hallucination', False)
                 
                 if cleaned or is_hallucination:
-                    is_bad = cleaned in dynamic_bad
+                    is_bad = prefs.get('ui_tgl_auto_filler', True) and (cleaned in dynamic_bad)
                     real_start = fix_t(w['start'])
                     real_end = fix_t(w['end'])
                     
@@ -2151,6 +2371,9 @@ except Exception as e:
                         "type": w.get("type", "word"),
                         "id": 0
                     }
+                    if is_bad and not is_hallucination:
+                        w_obj["is_bad"] = True
+                        w_obj["is_auto"] = True
                     if w_obj["type"] == "silence" or raw_txt == "[SILENCE]":
                         w_obj["type"] = "silence"
                         w_obj["status"] = "silence_mark" if getattr(self, '_is_cli', False) else "silence"
@@ -2609,10 +2832,62 @@ except Exception as e:
             if isinstance(project_state, list):
                 log_info("load_project_state: detected CLI-generated flat words list — wrapping.")
                 project_state = {"words_data": project_state}
-            
+
             words = project_state.get("words_data", [])
+
+            # Resolve language from saved state, words[0].meta_lang, or CJK content detection
+            raw_lang = project_state.get("lang_code") or (project_state.get("settings") or {}).get("lang")
+            if not raw_lang and words and isinstance(words[0], dict):
+                raw_lang = words[0].get("meta_lang")
+            if not raw_lang:
+                has_cjk_words = any(
+                    algorithms.has_cjk(w.get("text", ""))
+                    for w in words[:100]
+                    if isinstance(w, dict) and w.get("type") not in ("silence", "inaudible")
+                )
+                raw_lang = "zh" if has_cjk_words else "en"
+
+            lang_code, display_lang = config.resolve_language(raw_lang, default_code="en")
+            if lang_code == "auto":
+                display_lang = "Auto"
+            default_fillers = config.DEFAULT_BAD_WORDS_BY_LANG.get(lang_code, config.DEFAULT_BAD_WORDS)
+
+            project_state["lang_code"] = lang_code
+            project_state.setdefault("filler_words", list(default_fillers))
+            settings = project_state.setdefault("settings", {})
+            settings.setdefault("lang", display_lang)
+            settings.setdefault("filler_words", list(project_state["filler_words"]))
+
+            # Auto-load companion SRT if not embedded (e.g. CLI audio_words.json + audio.srt)
+            if not project_state.get("srt_content"):
+                candidates = []
+                if file_path.endswith("_words.json"):
+                    candidates.append(file_path[:-11] + ".srt")
+                candidates.append(os.path.splitext(file_path)[0] + ".srt")
+                for cand in candidates:
+                    if os.path.exists(cand):
+                        try:
+                            with open(cand, 'r', encoding='utf-8') as sf:
+                                project_state["srt_content"] = sf.read()
+                            project_state["srt_name"] = os.path.basename(cand)
+                            log_info(f"load_project_state: auto-loaded sibling SRT → {cand}")
+                        except Exception as srt_err:
+                            log_error(f"load_project_state: failed to read sibling SRT {cand}: {srt_err}")
+                        break
+
+            # Auto-load sibling clean_transcript.md into Script Comparison box if present
+            if not project_state.get("script_content"):
+                clean_md_path = os.path.join(os.path.dirname(file_path), "clean_transcript.md")
+                if os.path.exists(clean_md_path):
+                    try:
+                        with open(clean_md_path, 'r', encoding='utf-8') as sf:
+                            project_state["script_content"] = sf.read()
+                        log_info(f"load_project_state: auto-loaded sibling script → {clean_md_path}")
+                    except Exception as md_err:
+                        log_error(f"load_project_state: failed to read {clean_md_path}: {md_err}")
+
             segments = self._reconstruct_segments(words)
-            
+
             return project_state, segments
         except Exception as e:
             log_error(f"Load Project Error: {e}")
@@ -2648,6 +2923,11 @@ except Exception as e:
         
         result_words = algorithms.compare_script_to_transcript(script_text, words_data, algo_settings=algo_settings)
         final_words = algorithms.absorb_inaudible_into_repeats(result_words)
+        if prefs.get('ui_tgl_auto_filler', True):
+            raw_lang = prefs.get('lang', 'Auto')
+            lang_code, _ = config.resolve_language(raw_lang)
+            fillers = prefs.get('filler_words') or config.DEFAULT_BAD_WORDS_BY_LANG.get(lang_code, config.DEFAULT_BAD_WORDS)
+            final_words = algorithms.apply_auto_filler_logic(final_words, fillers, True, preserve_existing=True)
         # FIX: Force hallucination status after script comparison analysis
         final_words = self._enforce_hallucination_status(final_words)
         return final_words
@@ -2713,14 +2993,25 @@ except Exception as e:
 
             # ── SOURCE SNAPSHOT ───────────────────────────────────────────────
             source_snapshot   = settings.get("source_snapshot") or {}
-            original_tl_name  = source_snapshot.get("timeline_name") or settings.get("original_timeline_name")
-            if not original_tl_name:
-                original_tl_name = self.resolve_handler.timeline.GetName()
-                log_info(f"assemble_timeline: No source snapshot, using active: '{original_tl_name}'")
-            else:
+            
+            # Prioritize the actively opened timeline in Resolve
+            active_tl = self.resolve_handler.timeline
+            active_tl_name = active_tl.GetName() if active_tl else None
+            snap_tl_name = source_snapshot.get("timeline_name") or settings.get("original_timeline_name")
+
+            if active_tl_name:
+                original_tl_name = active_tl_name
+                log_info(f"assemble_timeline: Using actively opened timeline: '{original_tl_name}'")
+            elif snap_tl_name:
+                original_tl_name = snap_tl_name
                 log_info(f"assemble_timeline: Source snapshot → '{original_tl_name}'")
+            else:
+                original_tl_name = active_tl_name
 
             track_indices = source_snapshot.get("track_indices") or []
+            if snap_tl_name and active_tl_name and snap_tl_name != active_tl_name:
+                # Snapshot belonged to a different timeline; reset track indices to assemble all tracks
+                track_indices = []
 
             # ── SOURCE TIMELINE INSPECTION (single pass) ──────────────────────
             # Determine: audio_only_mode, a_track_count, for later use.
@@ -2888,7 +3179,10 @@ except Exception as e:
                                                 for i, (seg_k, seg) in enumerate(sorted(segments.items())):
                                                     f.write(f"{i+1}\n")
                                                     f.write(f"{fmt_time(seg['start'])} --> {fmt_time(seg['end'])}\n")
-                                                    f.write("".join(seg['texts']) + "\n\n")
+                                                    seg_raw = "".join(seg['texts'])
+                                                    has_cjk = bool(re.search(r'[\u4e00-\u9fff]', seg_raw))
+                                                    seg_line = seg_raw if has_cjk else re.sub(r'\s+', ' ', " ".join(t.strip() for t in seg['texts'])).strip()
+                                                    f.write(seg_line + "\n\n")
                                             
                                             log_info(f"assemble_timeline: Generated SRT at {srt_path}")
                                             self.current_srt_name = srt_name

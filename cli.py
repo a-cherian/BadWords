@@ -12,6 +12,7 @@ Usage:
 import os
 import sys
 import re
+import json
 import argparse
 import shutil
 import time
@@ -29,21 +30,24 @@ from engine import AudioEngine
 def _find_project_root(start_path: str) -> str:
     """
     Climb up the directory tree from start_path until we find a folder
-    whose name starts with a digit and contains ' - '  (e.g. '10 - 仙逆').
-    Returns that folder path, or start_path if none is found.
+    whose name starts with a digit and contains ' - ' (e.g. '10 - 仙逆').
+    If entered via a language subproject ('en', 'eng', 'zh'), return that
+    subproject path instead. Returns start_path if none is found.
     """
-    # Regex: folder name starts with one or more digits followed by ' - '
     _num_prefix = re.compile(r'^\d+\s*-\s+')
     path = os.path.abspath(start_path)
-    # Walk up until filesystem root
+    prev_path = path
     while True:
         name = os.path.basename(path)
         if _num_prefix.match(name):
+            if prev_path != path and os.path.basename(prev_path).lower() in ("en", "eng", "zh"):
+                return prev_path
             return path
         parent = os.path.dirname(path)
         if parent == path:
             # Reached filesystem root without finding a project folder
             return start_path
+        prev_path = path
         path = parent
 
 
@@ -52,14 +56,18 @@ def main():
         description="BadWords CLI - Transcribe and analyze audio/video independently of DaVinci Resolve."
     )
     parser.add_argument("--audio",  type=str, required=True,  help="Path to the input audio or video file.")
-    parser.add_argument("--model",  type=str, default="medium", help="Whisper model to use (default: medium).")
+    parser.add_argument("--model",  type=str, default=None,   help="Whisper model to use (default: turbo for en, medium otherwise).")
     parser.add_argument("--lang",   type=str, default="auto",  help="Language code or 'auto' (default: auto).")
     parser.add_argument("--device", type=str, default="Auto",  help="Device to use: Auto, CPU, or GPU (default: Auto).")
     parser.add_argument("--fps",    type=float, default=24.0,  help="Timeline FPS for timecode conversion (default: 24.0).")
     parser.add_argument("--script", type=str, default=None,   help="Optional path to a script/transcript text file for comparison.")
-    parser.add_argument("--output", type=str, default=None,   help="Optional output directory (default: <project_root>/output).")
+    parser.add_argument("--output", type=str, default=None,   help="Optional output directory (default: <project_root>/04_badwords or <project_root>/output).")
 
     args = parser.parse_args()
+
+    resolved_model = args.model
+    if not resolved_model:
+        resolved_model = "turbo" if str(args.lang).lower().strip() == "en" else "medium"
 
     input_path = os.path.abspath(args.audio)
     if not os.path.exists(input_path):
@@ -72,6 +80,8 @@ def main():
     
     if args.output:
         output_dir = os.path.abspath(args.output)
+    elif os.path.isdir(os.path.join(project_root, "04_badwords")) or os.path.isdir(os.path.join(project_root, "00_project")):
+        output_dir = os.path.join(project_root, "04_badwords")
     else:
         output_dir = os.path.join(project_root, "output")
         
@@ -83,7 +93,7 @@ def main():
     print(f"Input File:   {input_path}")
     print(f"Project Root: {project_root}")
     print(f"Output Dir:   {output_dir}")
-    print(f"Model: {args.model} | Lang: {args.lang} | Device: {args.device} | FPS: {args.fps}")
+    print(f"Model: {resolved_model} | Lang: {args.lang} | Device: {args.device} | FPS: {args.fps}")
     if args.script:
         print(f"Script:       {args.script}")
     print(f"--------------------------------------------------")
@@ -95,7 +105,7 @@ def main():
 
     settings = {
         'audio_path':    input_path,
-        'model':         args.model,
+        'model':         resolved_model,
         'lang':          args.lang,
         'device':        args.device,
         'skip_assembly': True,          # Bypass DaVinci Resolve timeline injection
@@ -176,8 +186,11 @@ def main():
     final_json_path = _safe_path(os.path.join(output_dir, f"{base_name}_words.json"))
     final_srt_path  = _safe_path(os.path.join(output_dir, f"{base_name}.srt"))
 
+    # Stamp language metadata onto words_data[0] so the GUI auto-switches language on import
+    if words_data and isinstance(words_data[0], dict):
+        words_data[0]["meta_lang"] = args.lang
+
     # Write the JSON directly
-    import json
     with open(final_json_path, 'w', encoding='utf-8') as f:
         json.dump(words_data, f, ensure_ascii=False, indent=2)
     print(f"\n[SUCCESS] JSON  → {final_json_path}")

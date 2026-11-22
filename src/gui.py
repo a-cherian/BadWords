@@ -9139,40 +9139,13 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
             
             state, _ = self.engine.load_project_state(path)
 
-            # ── Audio Sync Offset (CLI-generated JSONs) ────────────────────────────
-            # A CLI-generated file has no 'srt_content' and no 'settings' dict
-            # because it was produced outside of Resolve.  Show the offset dialog
-            # so the user can compensate for audio repositioning in the timeline.
-            is_cli_json = ('words_data' in state) and ('srt_content' not in state) and (not state.get('settings'))
-            if is_cli_json:
-                try:
-                    dlg = OffsetAlignmentDialog(
-                        self,
-                        resolve_handler=getattr(self.engine, 'resolve_handler', None)
-                    )
-                    dlg.exec()
-                    offset_s = dlg.offset
-                except Exception as _dlg_err:
-                    from osdoc import log_error
-                    log_error(f"OffsetAlignmentDialog error: {_dlg_err}")
-                    offset_s = 0.0
-
-                if offset_s != 0.0:
-                    from osdoc import log_info
-                    log_info(f"Applying JSON sync offset of {offset_s:+.3f}s to all word timestamps")
-                    words = state.get('words_data', [])
-                    for w in words:
-                        for key in ('s', 'e', 'start', 'end'):
-                            if key in w and isinstance(w[key], (int, float)):
-                                w[key] = max(0.0, w[key] + offset_s)
-                    state['words_data'] = words
-
             # Restore SRT if present
             srt_content = state.get("srt_content")
             srt_name = state.get("srt_name")
             if srt_content and srt_name:
                 try:
-                    srt_content = self.engine.scale_srt_timestamps(srt_content, 0.9)
+                    if state.get("srt_needs_09_scale", False):
+                        srt_content = self.engine.scale_srt_timestamps(srt_content, 0.9)
                     
                     temp_dir = self.engine.os_doc.get_temp_folder()
                     srt_path = os.path.join(temp_dir, srt_name)
@@ -9187,7 +9160,23 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
             from PySide6.QtCore import QTimer
 
             # --- 1. SYNC UI PREFERENCES ---
-            imported_prefs = state.get('settings', {})
+            imported_prefs = dict(state.get('settings') or {})
+
+            # Sync language dropdown & filler words from JSON so GUI matches project language
+            lang_val = imported_prefs.get('lang') or state.get('lang_code')
+            if lang_val:
+                lang_code, display_lang = config.resolve_language(lang_val)
+                fillers = (
+                    imported_prefs.get('filler_words')
+                    or state.get('filler_words')
+                    or config.DEFAULT_BAD_WORDS_BY_LANG.get(lang_code, config.DEFAULT_BAD_WORDS)
+                )
+                imported_prefs['lang'] = display_lang
+                imported_prefs['filler_words'] = list(fillers)
+                if hasattr(self, '_combo_lang') and display_lang:
+                    self._combo_lang.setText(display_lang)
+                if hasattr(self, 'txt_fillers') and fillers:
+                    self.txt_fillers.setText(", ".join(fillers))
             
             # --- Restore Source Snapshot ---
             imported_snapshot = (state.get('settings') or {}).get('transcription_source')
@@ -9766,12 +9755,35 @@ class BadWordsGUI(FramelessWindowMixin, _BaseMainWindow):
                 w['status'] = None
 
         # INJECT SOURCE SNAPSHOT
+        active_tl_name = None
+        if hasattr(self.engine, 'resolve_handler') and self.engine.resolve_handler:
+            try:
+                self.engine.resolve_handler.refresh_context()
+                if self.engine.resolve_handler.timeline:
+                    active_tl_name = self.engine.resolve_handler.timeline.GetName()
+            except Exception:
+                pass
+
         src = getattr(self, '_transcription_source', None)
         if not src:
             saved_src = (self.engine.load_preferences() or {}).get('transcription_source')
             if saved_src:
-                src = saved_src
+                src = dict(saved_src)
                 self._transcription_source = src
+
+        if active_tl_name:
+            if not src:
+                src = {
+                    "timeline_name": active_tl_name,
+                    "track_names": [],
+                    "track_indices": [],
+                    "all_tracks": True,
+                }
+            else:
+                src = dict(src)
+                src["timeline_name"] = active_tl_name
+            self._transcription_source = src
+
         if src:
             prefs["source_snapshot"] = src
 

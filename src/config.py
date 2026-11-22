@@ -53,8 +53,9 @@ def FS(size):
 # ==========================================
 # ANALYSIS PARAMETERS
 # ==========================================
-DEFAULT_BAD_WORDS = ["yyy", "eee", "aaa", "umm", "uh", "ah", "mhm"]
+DEFAULT_BAD_WORDS = ["um", "umm", "uh", "uhm", "er", "erm", "ah", "hm", "hmm", "mhm", "yyy", "eee", "aaa"]
 DEFAULT_BAD_WORDS_BY_LANG = {
+    "en": ["um", "umm", "uh", "uhm", "er", "erm", "ah", "hm", "hmm", "mhm"],
     "zh": ["嗯", "啊", "呃"],
     "yue": ["嗯", "啊", "呃"],
 }
@@ -628,6 +629,22 @@ SUPPORTED_LANGUAGES = {
     "zh": "中文", # Chinese
     "yue": "粵語", # Cantonese
 }
+
+
+def resolve_language(raw_lang, default_code="auto"):
+    """Maps a language code or display name to (lang_code, display_name)."""
+    if not raw_lang or str(raw_lang).strip().lower() == "auto":
+        return default_code, SUPPORTED_LANGUAGES.get(default_code, "Auto")
+    raw_str = str(raw_lang).strip()
+    if raw_str in SUPPORTED_LANGUAGES:
+        return raw_str, SUPPORTED_LANGUAGES[raw_str]
+    if raw_str.lower() in SUPPORTED_LANGUAGES:
+        code = raw_str.lower()
+        return code, SUPPORTED_LANGUAGES[code]
+    for code, name in SUPPORTED_LANGUAGES.items():
+        if name.lower() == raw_str.lower():
+            return code, name
+    return default_code, raw_str
 
 # ==========================================
 # TRANSLATIONS (I18N)

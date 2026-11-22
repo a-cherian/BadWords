@@ -613,13 +613,16 @@ class OSDoctor:
             # Fallback (Should typically not be reached if installed correctly)
             return "python"
         
-        # --- LINUX VENV FIX ---
-        # In Self-Contained mode, VENV is inside install_dir
-        venv_python = os.path.join(self.install_dir, "venv", "bin", "python3")
+        # --- LINUX / MAC VENV FIX ---
+        # Prefer local VENV inside install_dir, then shared whisperjav venv
+        for candidate in (
+            os.path.join(self.install_dir, "venv", "bin", "python3"),
+            os.path.expanduser("~/venvs/whisperjav/bin/python3"),
+        ):
+            if os.path.exists(candidate):
+                return candidate
         
-        if os.path.exists(venv_python): return venv_python
-        
-        # Fallback to system python
+        # Fallback to current python
         return sys.executable
 
     def check_dependencies(self):

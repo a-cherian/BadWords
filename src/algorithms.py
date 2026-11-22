@@ -65,6 +65,7 @@ except ImportError:
 # ==========================================
 
 STOP_WORDS = {"a", "an", "the", "in", "on", "at", "to", "of", "i", "you", "he", "she", "it", "we", "they", "is", "are", "and", "or"}
+DISCOURSE_FILLERS = {"um", "umm", "uh", "uhm", "er", "erm", "ah", "hm", "hmm", "mhm", "like", "you", "know", "yeah", "ugh", "oops", "cough"}
 
 # Fuzzy Thresholds
 THRESH_LONG = 0.65   # v7.5 Relaxed from 0.70 to reduce false positives
@@ -441,115 +442,201 @@ def apply_debug_rgb_pattern(words_data):
 class CompareEngine:
     """
     V7 Engine (Global Anchor + Gap Analysis)
-    Implements a strict binary trap for 94% accuracy.
+    Supports character-level Pinyin DP for CJK and fast word-level DP for English.
     """
     def __init__(self, script_text, words_data, algo_settings=None):
         self.script_text = script_text
         self.words_data = words_data
 
     def run(self):
+        is_cjk = has_cjk(self.script_text) or any(
+            has_cjk(w.get('text', '')) for w in self.words_data[:50]
+            if w.get('type') not in ['silence', 'inaudible']
+        )
 
-        def clean_text(text): 
-            return re.sub(r'[^\w\u4e00-\u9fff]', '', text)
+        def clean_cjk(text):
+            return re.sub(r'[^\w\u4e00-\u9fff]', '', text).lower()
 
-        def char_match(py1, py2, c1, c2):
-            if c1 == c2 and c1 != "": return 1.0
-            if py1 == py2 and py1 != "": return 0.8
-            if py1 and py2 and py1[0] == py2[0]: return 0.2
-            return -1.5
+        def clean_word(text):
+            return re.sub(r'[^\w]', '', text).lower()
 
-        def global_alignment(T_pys, S_pys, T_chars, S_chars):
-            M = len(T_pys)
-            N = len(S_pys)
+        def global_alignment(T_keys, S_keys, T_raw, S_raw, cjk_mode):
+            M = len(T_keys)
+            N = len(S_keys)
             dp = [[0.0] * (N + 1) for _ in range(M + 1)]
             ptr = [[0] * (N + 1) for _ in range(M + 1)]
-            
+
             GAP_OPEN = -2.5
             T_GAP_EXT = -0.5
             S_GAP_EXT = -1.0
-            
+
             for i in range(1, M + 1):
                 dp[i][0] = GAP_OPEN + i * T_GAP_EXT
                 ptr[i][0] = 1
+            dp0 = dp[0]
+            ptr0 = ptr[0]
             for j in range(1, N + 1):
-                dp[0][j] = GAP_OPEN + j * S_GAP_EXT
-                ptr[0][j] = 2
-                
+                dp0[j] = GAP_OPEN + j * S_GAP_EXT
+                ptr0[j] = 2
+
             for i in range(1, M + 1):
+                dp_i = dp[i]
+                dp_prev = dp[i - 1]
+                ptr_i = ptr[i]
+                ptr_prev = ptr[i - 1]
+                tk = T_keys[i - 1]
+                tr = T_raw[i - 1]
+                tr_4 = len(tr) >= 4
+                tr_pref = tr[:4] if tr_4 else ""
+                tk0 = tk[0] if tk else ""
+
                 for j in range(1, N + 1):
-                    score = char_match(T_pys[i-1], S_pys[j-1], T_chars[i-1], S_chars[j-1])
-                    match = dp[i-1][j-1] + score
-                    
-                    delete = dp[i-1][j] + T_GAP_EXT
-                    if ptr[i-1][j] != 1: delete += GAP_OPEN
-                        
-                    insert = dp[i][j-1] + S_GAP_EXT
-                    if ptr[i][j-1] != 2: insert += GAP_OPEN
-                    
-                    best = max(match, delete, insert)
-                    dp[i][j] = best
-                    if best == match: ptr[i][j] = 0
-                    elif best == delete: ptr[i][j] = 1
-                    else: ptr[i][j] = 2
-                    
+                    if cjk_mode:
+                        sr = S_raw[j - 1]
+                        sk = S_keys[j - 1]
+                        if tr == sr and tr != "":
+                            score = 1.0
+                        elif tk == sk and tk != "":
+                            score = 0.8
+                        elif tk0 and sk and tk0 == sk[0]:
+                            score = 0.2
+                        else:
+                            score = -1.5
+                    else:
+                        sr = S_raw[j - 1]
+                        if tr == sr:
+                            score = 1.0
+                        elif tr_4 and len(sr) >= 4 and tr_pref == sr[:4]:
+                            score = 0.5
+                        else:
+                            score = -1.5
+
+                    match = dp_prev[j - 1] + score
+                    delete = dp_prev[j] + T_GAP_EXT
+                    if ptr_prev[j] != 1:
+                        delete += GAP_OPEN
+                    insert = dp_i[j - 1] + S_GAP_EXT
+                    if ptr_i[j - 1] != 2:
+                        insert += GAP_OPEN
+
+                    best = match
+                    p = 0
+                    if delete > best:
+                        best = delete
+                        p = 1
+                    if insert > best:
+                        best = insert
+                        p = 2
+                    dp_i[j] = best
+                    ptr_i[j] = p
+
             i, j = M, N
             alignment = []
             while i > 0 or j > 0:
                 if ptr[i][j] == 0:
-                    alignment.append(('match', i-1, j-1))
-                    i -= 1; j -= 1
+                    alignment.append(('match', i - 1, j - 1))
+                    i -= 1
+                    j -= 1
                 elif ptr[i][j] == 1:
-                    alignment.append(('T_gap', i-1, None))
+                    alignment.append(('T_gap', i - 1, None))
                     i -= 1
                 else:
-                    alignment.append(('S_gap', None, j-1))
+                    alignment.append(('S_gap', None, j - 1))
                     j -= 1
-                    
+
             alignment.reverse()
             return alignment
 
-        def local_similarity(gap_T_pys, anchor_T_pys):
-            if len(gap_T_pys) == 0 or len(anchor_T_pys) == 0: return 0.0
-            M = len(gap_T_pys)
-            N = len(anchor_T_pys)
+        def local_similarity(gap_toks, anchor_toks, cjk_mode):
+            if len(gap_toks) == 0 or len(anchor_toks) == 0:
+                return 0.0
+            M = len(gap_toks)
+            N = len(anchor_toks)
             dp = [[0.0] * (N + 1) for _ in range(M + 1)]
-            max_score = 0
+            max_score = 0.0
             for i in range(1, M + 1):
+                dp_i = dp[i]
+                dp_prev = dp[i - 1]
+                g = gap_toks[i - 1]
+                g4 = (not cjk_mode) and len(g) >= 4
+                g_pref = g[:4] if g4 else ""
                 for j in range(1, N + 1):
-                    sc = 1.0 if gap_T_pys[i-1] == anchor_T_pys[j-1] else 0.0
-                    match = dp[i-1][j-1] + sc
-                    delete = dp[i-1][j] - 0.5
-                    insert = dp[i][j-1] - 0.5
-                    best = max(0.0, match, delete, insert)
-                    dp[i][j] = best
+                    a = anchor_toks[j - 1]
+                    if g == a:
+                        sc = 1.0
+                    elif g4 and len(a) >= 4 and g_pref == a[:4]:
+                        sc = 0.5
+                    else:
+                        sc = 0.0
+                    match = dp_prev[j - 1] + sc
+                    delete = dp_prev[j] - 0.5
+                    insert = dp_i[j - 1] - 0.5
+                    best = 0.0
+                    if match > best:
+                        best = match
+                    if delete > best:
+                        best = delete
+                    if insert > best:
+                        best = insert
+                    dp_i[j] = best
                     if best > max_score:
                         max_score = best
             return max_score / M if M > 0 else 0.0
 
-        S_chars = [c for c in clean_text(self.script_text)]
-        S_pys = [lazy_pinyin(c)[0] if lazy_pinyin(c) else "" for c in S_chars]
-
-        T_chars = []
-        T_pys = []
+        S_raw = []
+        S_keys = []
+        T_raw = []
+        T_keys = []
         word_mapping = []
-        for w_idx, w in enumerate(self.words_data):
-            if w.get('type') in ['silence', 'inaudible'] or w.get('is_inaudible') or w.get('_is_hallucination'):
-                if w.get('manual_status'):
-                    w['status'] = w.get('manual_status')
-                elif w.get('status') not in ['silence_mark', 'silence', 'inaudible']:
-                    w['status'] = None
-                w['selected'] = bool(w.get('status'))
-                w['is_auto'] = False
-                continue
-                
-            clean = clean_text(w.get('text', ''))
-            for c in clean:
-                T_chars.append(c)
-                T_pys.append(lazy_pinyin(c)[0] if lazy_pinyin(c) else "")
-                word_mapping.append(w_idx)
 
-        alignment = global_alignment(T_pys, S_pys, T_chars, S_chars)
-        
+        if is_cjk:
+            S_raw = [c for c in clean_cjk(self.script_text)]
+            if HAS_PYPINYIN:
+                S_keys = [lazy_pinyin(c)[0] if lazy_pinyin(c) else "" for c in S_raw]
+            else:
+                S_keys = list(S_raw)
+
+            for w_idx, w in enumerate(self.words_data):
+                if w.get('type') in ['silence', 'inaudible'] or w.get('is_inaudible') or w.get('_is_hallucination'):
+                    if w.get('manual_status'):
+                        w['status'] = w.get('manual_status')
+                    elif w.get('status') not in ['silence_mark', 'silence', 'inaudible']:
+                        w['status'] = None
+                    w['selected'] = bool(w.get('status'))
+                    w['is_auto'] = False
+                    continue
+
+                clean = clean_cjk(w.get('text', ''))
+                for c in clean:
+                    T_raw.append(c)
+                    T_keys.append((lazy_pinyin(c)[0] if lazy_pinyin(c) else "") if HAS_PYPINYIN else c)
+                    word_mapping.append(w_idx)
+        else:
+            for tok in re.split(r'[\s\-—–]+', self.script_text):
+                cw = clean_word(tok)
+                if cw:
+                    S_raw.append(cw)
+            S_keys = S_raw
+
+            for w_idx, w in enumerate(self.words_data):
+                if w.get('type') in ['silence', 'inaudible'] or w.get('is_inaudible') or w.get('_is_hallucination'):
+                    if w.get('manual_status'):
+                        w['status'] = w.get('manual_status')
+                    elif w.get('status') not in ['silence_mark', 'silence', 'inaudible']:
+                        w['status'] = None
+                    w['selected'] = bool(w.get('status'))
+                    w['is_auto'] = False
+                    continue
+
+                for tok in re.split(r'[\s\-—–]+', w.get('text', '')):
+                    cw = clean_word(tok)
+                    if cw:
+                        T_raw.append(cw)
+                        word_mapping.append(w_idx)
+            T_keys = T_raw
+
+        alignment = global_alignment(T_keys, S_keys, T_raw, S_raw, is_cjk)
+
         blocks = []
         current_type = None
         curr_T = []
@@ -569,42 +656,74 @@ class CompareEngine:
                 w['status'] = 'normal'
                 w['selected'] = False
                 w['is_auto'] = True
+                w['is_bad'] = False
+                w.pop('_is_script_filler', None)
+
+        anchor_limit = 30
+        sim_threshold = 0.5 if is_cjk else 0.35
+        min_anchor_run = 1 if is_cjk else 3
 
         for idx, block in enumerate(blocks):
             if block['type'] == 'T_gap':
                 next_match_T = []
                 for next_idx in range(idx + 1, len(blocks)):
-                    if blocks[next_idx]['type'] == 'match':
-                        next_match_T.extend(blocks[next_idx]['T_indices'])
-                        if len(next_match_T) >= 30:
+                    nb = blocks[next_idx]
+                    if nb['type'] == 'match' and len(nb['T_indices']) >= min_anchor_run:
+                        next_match_T.extend(nb['T_indices'])
+                        if len(next_match_T) >= anchor_limit:
                             break
-                
+                if not next_match_T and min_anchor_run > 1:
+                    for next_idx in range(idx + 1, len(blocks)):
+                        if blocks[next_idx]['type'] == 'match':
+                            next_match_T.extend(blocks[next_idx]['T_indices'])
+                            if len(next_match_T) >= anchor_limit:
+                                break
+
                 prev_match_T = []
                 for prev_idx in range(idx - 1, -1, -1):
-                    if blocks[prev_idx]['type'] == 'match':
-                        prev_match_T = blocks[prev_idx]['T_indices'] + prev_match_T
-                        if len(prev_match_T) >= 30:
+                    pb = blocks[prev_idx]
+                    if pb['type'] == 'match' and len(pb['T_indices']) >= min_anchor_run:
+                        prev_match_T = pb['T_indices'] + prev_match_T
+                        if len(prev_match_T) >= anchor_limit:
                             break
-                
+                if not prev_match_T and min_anchor_run > 1:
+                    for prev_idx in range(idx - 1, -1, -1):
+                        if blocks[prev_idx]['type'] == 'match':
+                            prev_match_T = blocks[prev_idx]['T_indices'] + prev_match_T
+                            if len(prev_match_T) >= anchor_limit:
+                                break
+
                 status = 'bad'
-                if len(block['T_indices']) > 0:
-                    gap_pys = [T_pys[i] for i in block['T_indices']]
-                    
+                is_filler_gap = (
+                    not is_cjk
+                    and 0 < len(block['T_indices']) <= 4
+                    and all(T_keys[i] in DISCOURSE_FILLERS for i in block['T_indices'])
+                )
+                if len(block['T_indices']) > 0 and not is_filler_gap:
+                    gap_toks = [T_keys[i] for i in block['T_indices']]
+
                     if len(next_match_T) > 0:
-                        anchor_pys = [T_pys[i] for i in next_match_T][:30]
-                        if local_similarity(gap_pys, anchor_pys) > 0.5:
+                        anchor_toks = [T_keys[i] for i in next_match_T][:anchor_limit]
+                        if (local_similarity(gap_toks, anchor_toks, is_cjk) >= sim_threshold
+                                if not is_cjk else
+                                local_similarity(gap_toks, anchor_toks, is_cjk) > sim_threshold):
                             status = 'repeat'
-                            
+
                     if status != 'repeat' and len(prev_match_T) > 0:
-                        anchor_pys = [T_pys[i] for i in prev_match_T][-30:]
-                        if local_similarity(gap_pys, anchor_pys) > 0.5:
+                        anchor_toks = [T_keys[i] for i in prev_match_T][-anchor_limit:]
+                        if (local_similarity(gap_toks, anchor_toks, is_cjk) >= sim_threshold
+                                if not is_cjk else
+                                local_similarity(gap_toks, anchor_toks, is_cjk) > sim_threshold):
                             status = 'repeat'
-                    
+
                 for t_idx in block['T_indices']:
                     w_idx = word_mapping[t_idx]
                     self.words_data[w_idx]['status'] = status
                     self.words_data[w_idx]['selected'] = True
                     self.words_data[w_idx]['is_auto'] = True
+                    if is_filler_gap:
+                        self.words_data[w_idx]['_is_script_filler'] = True
+                        self.words_data[w_idx]['is_bad'] = True
         return self.words_data
 
 def compare_script_to_transcript(script_text, words_data, algo_settings=None):
@@ -770,19 +889,30 @@ def analyze_repeats(words_data, show_inaudible=True, algo_settings=None):
 # 6. GUI LOGIC HELPERS (Decoupled Logic)
 # ==========================================
 
-def apply_auto_filler_logic(words_data, fillers, is_enabled):
+def apply_auto_filler_logic(words_data, fillers, is_enabled, preserve_existing=False):
     fillers_lower = [to_simplified(f.lower()) for f in fillers]
     for w in words_data:
+        if w.get('type') in ('silence', 'inaudible') or w.get('is_inaudible') or w.get('_is_hallucination'):
+            continue
         raw_text = to_simplified(w.get('text', ''))
         clean_text = raw_text.strip(".,?!:;\"'()[]{}<>，。！？：；“”‘’„”（）【】《》、…—").lower()
-        if is_enabled and clean_text in fillers_lower:
-            if not w.get('manual_status'): # Do not overwrite manual markings
-                w['status'] = 'bad'
-                w['is_auto'] = True
-                w['selected'] = True
-        else:
+        is_filler_tok = (clean_text in fillers_lower) or bool(w.get('_is_script_filler'))
+        if is_filler_tok:
+            if is_enabled:
+                if not w.get('manual_status'): # Do not overwrite manual markings
+                    w['status'] = 'bad'
+                    w['is_bad'] = True
+                    w['is_auto'] = True
+                    w['selected'] = True
+            else:
+                if w.get('is_auto') or w.get('is_bad'):
+                    w['status'] = w.get('manual_status') or 'normal'
+                    w['is_bad'] = False
+                    w['is_auto'] = False
+                    w['selected'] = w['status'] in ('bad', 'inaudible', 'typo', 'repeat')
+        elif not preserve_existing:
             # CLEANUP: If it was auto-marked previously, but no longer qualifies, clear it
-            if w.get('is_auto'):
+            if w.get('is_auto') and w.get('status') not in ('repeat', 'bad'):
                 w['status'] = w.get('manual_status')
                 w['is_auto'] = False
                 w['selected'] = bool(w['status'])
@@ -839,6 +969,9 @@ def propagate_status_change(words_data, target_id, new_status):
         w_obj['status'] = new_status
         w_obj['manual_status'] = new_status # Base layer
         w_obj['is_auto'] = False # Remove auto flag
+        if new_status is None:
+            w_obj['is_bad'] = False
+            w_obj['algo_status'] = None
         
         w_obj['selected'] = (new_status in ['bad', 'inaudible', 'typo', 'repeat'])
         updates.append((w_obj['id'], new_status))
